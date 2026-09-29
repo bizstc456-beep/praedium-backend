@@ -4,6 +4,8 @@
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const dotenv = require('dotenv');
 const { createClient } = require('@supabase/supabase-js');
 const Stripe = require('stripe');
@@ -22,7 +24,54 @@ if (process.env.NODE_ENV !== 'production') {
 
 const app = express();
 
+// Railway sits in front of this app behind a reverse proxy, so req.ip would
+// otherwise resolve to the proxy's address for every request. Trusting the
+// first proxy hop lets express-rate-limit key on the real client IP.
+app.set('trust proxy', 1);
+
 // Middleware
+// crossOriginResourcePolicy defaults to "same-origin" in helmet, which would
+// block the frontend (a different origin - Vercel vs Railway) from reading
+// API responses via fetch. Loosen just that piece; keep helmet's other
+// defaults (CSP, etc. - mostly inert for a pure JSON API anyway).
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
+
+// Allowed origins for browser requests. Set FRONTEND_URL on Railway to the
+// deployed frontend's origin; localhost is always allowed for local dev.
+const allowedOrigins = [
+  process.env.FRONTEND_URL || 'https://rentflow-frontend-phi.vercel.app',
+  'http://localhost:3000',
+];
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (curl, mobile apps, server-to-server, Stripe webhooks)
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
+}));
+
+// Rate limiting: general API traffic gets a generous cap, auth endpoints
+// (prone to abuse - credential stuffing, spam signups) get a tighter one.
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts, please try again later.' },
+});
+app.use('/api/', apiLimiter);
+app.use('/api/auth/', authLimiter);
+
 // The Stripe webhook route needs the raw request body (not JSON-parsed) to
 // verify the signature, so it must be excluded from the global JSON parser.
 app.use((req, res, next) => {
@@ -31,7 +80,6 @@ app.use((req, res, next) => {
   }
   return express.json()(req, res, next);
 });
-app.use(cors());
 
 // Supabase (Database)
 const supabase = createClient(
