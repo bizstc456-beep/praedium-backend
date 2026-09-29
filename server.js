@@ -2353,6 +2353,24 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
       process.env.STRIPE_WEBHOOK_SECRET
     );
 
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      const userId = session.metadata && session.metadata.user_id;
+
+      if (userId && session.mode === 'subscription') {
+        await supabase
+          .from('customers')
+          .update({
+            stripe_customer_id: session.customer,
+            stripe_subscription_id: session.subscription,
+            subscription_status: 'trialing',
+          })
+          .eq('user_id', userId);
+      } else {
+        console.error('checkout.session.completed missing user_id metadata or not a subscription', session.id);
+      }
+    }
+
     if (event.type === 'invoice.payment_succeeded') {
       const invoice = event.data.object;
       await supabase
