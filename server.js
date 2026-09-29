@@ -23,7 +23,14 @@ if (process.env.NODE_ENV !== 'production') {
 const app = express();
 
 // Middleware
-app.use(express.json());
+// The Stripe webhook route needs the raw request body (not JSON-parsed) to
+// verify the signature, so it must be excluded from the global JSON parser.
+app.use((req, res, next) => {
+  if (req.originalUrl === '/api/webhooks/stripe') {
+    return next();
+  }
+  return express.json()(req, res, next);
+});
 app.use(cors());
 
 // Supabase (Database)
