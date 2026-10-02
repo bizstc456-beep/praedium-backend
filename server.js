@@ -1,5 +1,5 @@
 // ============================================
-// FILE: server.js - RENTFLOW BACKEND
+// FILE: server.js - PRAEDIUM BACKEND
 // ============================================
 
 const express = require('express');
@@ -41,7 +41,7 @@ app.use(helmet({
 // Allowed origins for browser requests. Set FRONTEND_URL on Railway to the
 // deployed frontend's origin; localhost is always allowed for local dev.
 const allowedOrigins = [
-  process.env.FRONTEND_URL || 'https://rentflow-frontend-phi.vercel.app',
+  process.env.FRONTEND_URL || 'https://www.praedium.pro',
   'http://localhost:3000',
 ];
 app.use(cors({
@@ -1489,7 +1489,7 @@ app.post('/api/tenants/:tenant_id/invite', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'This tenant already has a portal account' });
     }
 
-    const frontendUrl = process.env.FRONTEND_URL || 'https://rentflow-frontend-phi.vercel.app';
+    const frontendUrl = process.env.FRONTEND_URL || 'https://www.praedium.pro';
 
     const { data: inviteData, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(
       tenant.email,
@@ -2280,7 +2280,7 @@ app.post('/api/create-checkout-session', requireAuth, async (req, res) => {
       return res.status(500).json({ error: 'STRIPE_PRICE_ID is not configured on the server' });
     }
 
-    const frontendUrl = process.env.FRONTEND_URL || 'https://rentflow-frontend-phi.vercel.app';
+    const frontendUrl = process.env.FRONTEND_URL || 'https://www.praedium.pro';
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -2762,7 +2762,7 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Rentflow backend running on port ${PORT}`);
+  console.log(`Praedium backend running on port ${PORT}`);
 });
 
 module.exports = app;

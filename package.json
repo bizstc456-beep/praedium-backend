@@ -1,7 +1,7 @@
 {
-  "name": "rentflow-backend",
+  "name": "praedium-backend",
   "version": "1.0.0",
-  "description": "Rentflow rental property management backend",
+  "description": "Praedium rental property management backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
