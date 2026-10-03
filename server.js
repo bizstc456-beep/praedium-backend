@@ -90,6 +90,44 @@ const supabase = createClient(
 // Stripe (Payments)
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
+// Subscription tiers. Unit caps are counted across ALL of a landlord's
+// properties using inferUnitCount() (defined further down: duplex=2,
+// triplex=3, fourplex=4, else 1) -- NOT a count of properties. Each tier's
+// Stripe Price id lives in its own env var so switching Stripe test/live
+// mode or rotating a price id never touches this code.
+const PLAN_TIERS = {
+  starter: { label: 'Starter', maxUnits: 5, priceEnvVar: 'STRIPE_PRICE_STARTER' },
+  growth: { label: 'Growth', maxUnits: 20, priceEnvVar: 'STRIPE_PRICE_GROWTH' },
+  portfolio: { label: 'Portfolio', maxUnits: Infinity, priceEnvVar: 'STRIPE_PRICE_PORTFOLIO' },
+};
+const DEFAULT_PLAN_TIER = 'starter';
+
+// Sums inferred unit counts across every property a landlord owns -- the
+// basis for enforcing their plan's unit cap. Safe to call from any route
+// even though inferUnitCount is defined later in this file: routes only
+// run after the whole module (and therefore inferUnitCount) has loaded.
+async function getUnitUsageForUser(userId) {
+  const { data: props, error } = await supabase
+    .from('properties')
+    .select('property_type')
+    .eq('user_id', userId);
+  if (error) throw error;
+  return (props || []).reduce((sum, p) => sum + inferUnitCount(p.property_type), 0);
+}
+
+// Looks up a landlord's plan tier, falling back to Starter if the customers
+// row has no plan_tier yet (e.g. it predates this column) or holds an
+// unrecognized value.
+async function getPlanTierForUser(userId) {
+  const { data: customer } = await supabase
+    .from('customers')
+    .select('plan_tier')
+    .eq('user_id', userId)
+    .single();
+  const tierKey = customer && customer.plan_tier;
+  return PLAN_TIERS[tierKey] ? tierKey : DEFAULT_PLAN_TIER;
+}
+
 // Twilio (SMS)
 const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
@@ -206,7 +244,8 @@ app.post('/api/auth/register', async (req, res) => {
           name,
           phone,
           trial_ends_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-          status: 'active'
+          status: 'active',
+          plan_tier: DEFAULT_PLAN_TIER
         }
       ])
       .select();
@@ -260,6 +299,20 @@ app.post('/api/properties', requireAuth, async (req, res) => {
 
     if (!address || !city) {
       return res.status(400).json({ error: 'Address and city are required' });
+    }
+
+    const newUnits = inferUnitCount(property_type);
+    const tierKey = await getPlanTierForUser(req.user.id);
+    const tier = PLAN_TIERS[tierKey];
+    const currentUnits = await getUnitUsageForUser(req.user.id);
+    if (currentUnits + newUnits > tier.maxUnits) {
+      return res.status(403).json({
+        error: `Adding this property would put you at ${currentUnits + newUnits} units, over your ${tier.label} plan's ${tier.maxUnits}-unit limit. Upgrade your plan to add more.`,
+        code: 'plan_limit_reached',
+        plan_tier: tierKey,
+        max_units: tier.maxUnits,
+        current_units: currentUnits
+      });
     }
 
     const { data, error } = await supabase
@@ -336,6 +389,32 @@ app.put('/api/properties/:property_id', requireAuth, async (req, res) => {
     }
 
     const { address, city, province, postal_code, property_type, bedrooms, bathrooms, notes } = req.body;
+
+    if (property_type) {
+      const { data: currentProp } = await supabase
+        .from('properties')
+        .select('property_type')
+        .eq('id', property_id)
+        .single();
+      const oldUnits = inferUnitCount(currentProp && currentProp.property_type);
+      const newUnits = inferUnitCount(property_type);
+      if (newUnits > oldUnits) {
+        const tierKey = await getPlanTierForUser(existing.user_id);
+        const tier = PLAN_TIERS[tierKey];
+        const currentTotalUnits = await getUnitUsageForUser(existing.user_id);
+        const projectedUnits = currentTotalUnits - oldUnits + newUnits;
+        if (projectedUnits > tier.maxUnits) {
+          return res.status(403).json({
+            error: `Changing this property's type would put you at ${projectedUnits} units, over your ${tier.label} plan's ${tier.maxUnits}-unit limit. Upgrade your plan to add more.`,
+            code: 'plan_limit_reached',
+            plan_tier: tierKey,
+            max_units: tier.maxUnits,
+            current_units: currentTotalUnits
+          });
+        }
+      }
+    }
+
     const updates = { address, city, province, postal_code, property_type, bedrooms, bathrooms, notes };
 
     const { data, error } = await supabase
@@ -2268,6 +2347,33 @@ app.post('/api/webhooks/twilio/inbound', express.urlencoded({ extended: false })
 // Create a hosted Stripe Checkout session for the $150/mo plan with a 30-day trial.
 // Card is collected now (required to auto-convert to the paid plan after the trial),
 // but nothing is charged until the trial ends.
+// Current plan tier + unit usage for a landlord -- drives the pricing
+// page's "current plan" state and the upgrade prompt when a create/edit is
+// blocked by the unit cap.
+app.get('/api/billing/plan/:user_id', requireAuth, async (req, res) => {
+  try {
+    const { user_id } = req.params;
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'This billing account does not belong to you' });
+    }
+
+    const tierKey = await getPlanTierForUser(user_id);
+    const tier = PLAN_TIERS[tierKey];
+    const currentUnits = await getUnitUsageForUser(user_id);
+
+    res.json({
+      success: true,
+      plan_tier: tierKey,
+      plan_label: tier.label,
+      max_units: tier.maxUnits === Infinity ? null : tier.maxUnits,
+      current_units: currentUnits
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/create-checkout-session', requireAuth, async (req, res) => {
   try {
     // Identity comes from the verified session, never the request body --
@@ -2276,8 +2382,14 @@ app.post('/api/create-checkout-session', requireAuth, async (req, res) => {
     const userId = req.user.id;
     const email = req.user.email;
 
-    if (!process.env.STRIPE_PRICE_ID) {
-      return res.status(500).json({ error: 'STRIPE_PRICE_ID is not configured on the server' });
+    const tierKey = PLAN_TIERS[req.body.tier] ? req.body.tier : null;
+    if (!tierKey) {
+      return res.status(400).json({ error: `tier is required and must be one of: ${Object.keys(PLAN_TIERS).join(', ')}` });
+    }
+    const tier = PLAN_TIERS[tierKey];
+    const priceId = process.env[tier.priceEnvVar];
+    if (!priceId) {
+      return res.status(500).json({ error: `${tier.priceEnvVar} is not configured on the server` });
     }
 
     const frontendUrl = process.env.FRONTEND_URL || 'https://www.praedium.pro';
@@ -2288,15 +2400,15 @@ app.post('/api/create-checkout-session', requireAuth, async (req, res) => {
       customer_email: email,
       line_items: [
         {
-          price: process.env.STRIPE_PRICE_ID,
+          price: priceId,
           quantity: 1,
         },
       ],
       subscription_data: {
         trial_period_days: 30,
-        metadata: { user_id: userId },
+        metadata: { user_id: userId, plan_tier: tierKey },
       },
-      metadata: { user_id: userId },
+      metadata: { user_id: userId, plan_tier: tierKey },
       success_url: `${frontendUrl}/payment?checkout=success`,
       cancel_url: `${frontendUrl}/payment?checkout=cancelled`,
     });
@@ -2413,12 +2525,14 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
       const userId = session.metadata && session.metadata.user_id;
 
       if (userId && session.mode === 'subscription') {
+        const planTier = (session.metadata && session.metadata.plan_tier) || DEFAULT_PLAN_TIER;
         await supabase
           .from('customers')
           .update({
             stripe_customer_id: session.customer,
             stripe_subscription_id: session.subscription,
             subscription_status: 'trialing',
+            plan_tier: planTier,
           })
           .eq('user_id', userId);
       } else {
