@@ -2358,16 +2358,30 @@ app.get('/api/billing/plan/:user_id', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'This billing account does not belong to you' });
     }
 
+    const { data: customer } = await supabase
+      .from('customers')
+      .select('plan_tier, subscription_status')
+      .eq('user_id', user_id)
+      .single();
+
     const tierKey = await getPlanTierForUser(user_id);
     const tier = PLAN_TIERS[tierKey];
     const currentUnits = await getUnitUsageForUser(user_id);
+    // A customer has plan_tier = Starter by default from registration, before
+    // they have ever been through checkout -- subscription_status is only
+    // ever set by the Stripe webhook, so its presence is what actually means
+    // "this tier is active", not just "this is the fallback tier".
+    const subscriptionStatus = customer ? customer.subscription_status : null;
+    const hasSubscription = Boolean(subscriptionStatus);
 
     res.json({
       success: true,
       plan_tier: tierKey,
       plan_label: tier.label,
       max_units: tier.maxUnits === Infinity ? null : tier.maxUnits,
-      current_units: currentUnits
+      current_units: currentUnits,
+      subscription_status: subscriptionStatus,
+      has_subscription: hasSubscription
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
