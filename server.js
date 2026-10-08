@@ -12,6 +12,7 @@ const Stripe = require('stripe');
 const twilio = require('twilio');
 const Anthropic = require('@anthropic-ai/sdk');
 const multer = require('multer');
+const cron = require('node-cron');
 
 // Load .env only in development, not in production (Railway)
 if (process.env.NODE_ENV !== 'production') {
@@ -90,17 +91,17 @@ const supabase = createClient(
 // Stripe (Payments)
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// Subscription tiers. Unit caps are counted across ALL of a landlord's
-// properties using inferUnitCount() (defined further down: duplex=2,
-// triplex=3, fourplex=4, else 1) -- NOT a count of properties. Each tier's
-// Stripe Price id lives in its own env var so switching Stripe test/live
-// mode or rotating a price id never touches this code.
-const PLAN_TIERS = {
-  starter: { label: 'Starter', maxUnits: 5, priceEnvVar: 'STRIPE_PRICE_STARTER' },
-  growth: { label: 'Growth', maxUnits: 20, priceEnvVar: 'STRIPE_PRICE_GROWTH' },
-  portfolio: { label: 'Portfolio', maxUnits: Infinity, priceEnvVar: 'STRIPE_PRICE_PORTFOLIO' },
-};
-const DEFAULT_PLAN_TIER = 'starter';
+// Subscription tiers and the unit-cap math live in lib/planLogic.js so they
+// can be unit-tested without a database, Stripe, or Twilio -- see
+// __tests__/planLogic.test.js. Never redefine these here; edit that file.
+const {
+  PLAN_TIERS,
+  DEFAULT_PLAN_TIER,
+  UNITS_BY_PROPERTY_TYPE,
+  inferUnitCount,
+  isValidTierKey,
+  resolveTierKey,
+} = require('./lib/planLogic');
 
 // Sums inferred unit counts across every property a landlord owns -- the
 // basis for enforcing their plan's unit cap. Safe to call from any route
@@ -511,7 +512,7 @@ app.post('/api/tenants', requireAuth, async (req, res) => {
 
     const { data: property, error: propertyError } = await supabase
       .from('properties')
-      .select('user_id')
+      .select('user_id, address')
       .eq('id', property_id)
       .single();
     if (propertyError || !property) {
@@ -544,7 +545,18 @@ app.post('/api/tenants', requireAuth, async (req, res) => {
       return res.status(400).json({ error: error.message });
     }
 
-    res.json({ success: true, tenant: data[0] });
+    const newTenant = data[0];
+
+    // Lease-signed automation: fire a welcome SMS as soon as a tenant/lease
+    // is created. Best-effort -- a failed text never fails tenant creation.
+    try {
+      const welcomeMessage = await generateWelcomeMessage(newTenant.name, property.address, newTenant.unit_label);
+      await sendSMS(newTenant.phone, welcomeMessage, property.user_id);
+    } catch (smsError) {
+      console.error('Welcome SMS failed:', smsError);
+    }
+
+    res.json({ success: true, tenant: newTenant });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1168,10 +1180,7 @@ app.get('/api/reports/:user_id', requireAuth, async (req, res) => {
 // from property_type -- there's no explicit unit-count field on properties,
 // so a duplex/triplex/fourplex is assumed to be exactly that many units and
 // everything else (single-family, condo, unset) is one.
-const UNITS_BY_PROPERTY_TYPE = { duplex: 2, triplex: 3, fourplex: 4 };
-function inferUnitCount(propertyType) {
-  return UNITS_BY_PROPERTY_TYPE[propertyType] || 1;
-}
+// UNITS_BY_PROPERTY_TYPE / inferUnitCount now come from lib/planLogic.js (required near the top of this file).
 
 app.get('/api/insights/:user_id', requireAuth, async (req, res) => {
   try {
@@ -1662,18 +1671,40 @@ app.get('/api/tenant-portal/maintenance', requireTenantAuth, async (req, res) =>
       return res.status(400).json({ error: error.message });
     }
 
-    res.json({ success: true, requests: data });
+    const withPhotoUrls = await Promise.all((data || []).map(async (r) => {
+      if (!r.photo_path) return r;
+      const { data: signed } = await supabase.storage
+        .from(DOCUMENTS_BUCKET)
+        .createSignedUrl(r.photo_path, 3600);
+      return { ...r, photo_url: signed?.signedUrl || null };
+    }));
+
+    res.json({ success: true, requests: withPhotoUrls });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Tenant portal: submit a new maintenance request
-app.post('/api/tenant-portal/maintenance', requireTenantAuth, async (req, res) => {
+// Tenant portal: submit a new maintenance request. Accepts multipart/form-data
+// (title, description, and an optional 'photo' file) so a tenant can attach a
+// picture of the issue -- plain JSON with no photo still works the same way.
+app.post('/api/tenant-portal/maintenance', requireTenantAuth, upload.single('photo'), async (req, res) => {
   try {
     const { title, description } = req.body;
     if (!title) {
       return res.status(400).json({ error: 'title is required' });
+    }
+
+    let photoPath = null;
+    if (req.file) {
+      const safeName = req.file.originalname.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+      photoPath = `maintenance/${req.tenant.id}/${Date.now()}-${safeName}`;
+      const { error: uploadError } = await supabase.storage
+        .from(DOCUMENTS_BUCKET)
+        .upload(photoPath, req.file.buffer, { contentType: req.file.mimetype });
+      if (uploadError) {
+        return res.status(400).json({ error: uploadError.message });
+      }
     }
 
     const { data, error } = await supabase
@@ -1685,6 +1716,7 @@ app.post('/api/tenant-portal/maintenance', requireTenantAuth, async (req, res) =
           title,
           description: description || '',
           status: 'open',
+          photo_path: photoPath,
           created_at: new Date(),
           updated_at: new Date(),
         },
@@ -1692,6 +1724,9 @@ app.post('/api/tenant-portal/maintenance', requireTenantAuth, async (req, res) =
       .select();
 
     if (error) {
+      if (photoPath) {
+        await supabase.storage.from(DOCUMENTS_BUCKET).remove([photoPath]);
+      }
       return res.status(400).json({ error: error.message });
     }
 
@@ -1731,7 +1766,15 @@ app.get('/api/maintenance/landlord/:user_id', requireAuth, async (req, res) => {
       return res.status(400).json({ error: error.message });
     }
 
-    res.json({ success: true, requests });
+    const withPhotoUrls = await Promise.all((requests || []).map(async (r) => {
+      if (!r.photo_path) return r;
+      const { data: signed } = await supabase.storage
+        .from(DOCUMENTS_BUCKET)
+        .createSignedUrl(r.photo_path, 3600);
+      return { ...r, photo_url: signed?.signedUrl || null };
+    }));
+
+    res.json({ success: true, requests: withPhotoUrls });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -2580,6 +2623,21 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
 // HELPER FUNCTIONS
 // ============================================
 
+async function generateWelcomeMessage(tenantName, propertyAddress, unitLabel) {
+  const message = await anthropic.messages.create({
+    model: 'claude-opus-5',
+    max_tokens: 100,
+    messages: [
+      {
+        role: 'user',
+        content: `Write a brief, friendly SMS welcome message (under 160 characters) to a new tenant whose lease was just created. Tenant name: ${tenantName}. Property: ${propertyAddress || 'their new home'}${unitLabel ? `, unit ${unitLabel}` : ''}. Be warm and professional, and mention they can submit maintenance requests and will get rent reminders through the tenant portal.`
+      }
+    ]
+  });
+
+  return message.content[0].text;
+}
+
 async function generatePaymentConfirmationMessage(tenantName, amount) {
   const message = await anthropic.messages.create({
     model: 'claude-opus-5',
@@ -2632,6 +2690,92 @@ function generateReceipt(tenantName, amount, paymentDate, paymentMethod) {
     receipt_number: `REC-${Date.now()}`,
     timestamp: new Date()
   };
+}
+
+// ============================================
+// AUTOMATED RENT REMINDERS
+// ============================================
+// Runs once a day. A tenant's rent due day is inferred from the day-of-month
+// of their lease_start_date (clamped to the current month's length -- a
+// lease that started on the 31st falls back to the 28th/30th in short
+// months). Sends a reminder 3 days before rent is due and a late notice 2
+// days after, but only when no 'paid' payment has been recorded yet this
+// calendar month, so a tenant who already paid is never texted twice.
+// Set ENABLE_RENT_REMINDERS=false in the environment to turn this off
+// without a code change.
+const RENT_REMINDERS_ENABLED = process.env.ENABLE_RENT_REMINDERS !== 'false';
+
+function clampDueDay(dueDay, year, month) {
+  const lastDayOfMonth = new Date(year, month + 1, 0).getDate();
+  return Math.min(dueDay, lastDayOfMonth);
+}
+
+async function hasPaymentThisMonth(tenantId, referenceDate) {
+  const startOfMonth = new Date(referenceDate.getFullYear(), referenceDate.getMonth(), 1).toISOString();
+  const { data, error } = await supabase
+    .from('payments')
+    .select('id')
+    .eq('tenant_id', tenantId)
+    .eq('status', 'paid')
+    .gte('payment_date', startOfMonth)
+    .limit(1);
+  if (error) {
+    console.error('hasPaymentThisMonth check failed:', error.message);
+    return false; // fail open toward sending the reminder rather than silently skipping it
+  }
+  return (data || []).length > 0;
+}
+
+async function sendDueRentReminders() {
+  if (!RENT_REMINDERS_ENABLED) return;
+  try {
+    const { data: tenants, error } = await supabase
+      .from('tenants')
+      .select('id, name, phone, rent_amount, lease_start_date, property_id')
+      .not('lease_start_date', 'is', null)
+      .not('phone', 'is', null);
+    if (error) {
+      console.error('Rent reminder fetch failed:', error.message);
+      return;
+    }
+
+    const today = new Date();
+    const year = today.getFullYear();
+    const month = today.getMonth();
+    const todayDateOnly = new Date(year, month, today.getDate());
+
+    for (const tenant of tenants || []) {
+      if (!tenant.rent_amount) continue;
+
+      const dueDay = new Date(tenant.lease_start_date).getDate();
+      const thisMonthDueDate = new Date(year, month, clampDueDay(dueDay, year, month));
+      const diffDays = Math.round((todayDateOnly - thisMonthDueDate) / 86400000);
+
+      const isUpcoming = diffDays === -3;
+      const isLate = diffDays === 2;
+      if (!isUpcoming && !isLate) continue;
+
+      const alreadyPaid = await hasPaymentThisMonth(tenant.id, today);
+      if (alreadyPaid) continue;
+
+      const message = isUpcoming
+        ? `Hi ${tenant.name}, friendly reminder that your rent of $${tenant.rent_amount} is due in 3 days.`
+        : `Hi ${tenant.name}, your rent of $${tenant.rent_amount} was due a couple days ago. Please arrange payment as soon as you can.`;
+
+      try {
+        const { data: property } = await supabase.from('properties').select('user_id').eq('id', tenant.property_id).single();
+        await sendSMS(tenant.phone, message, property ? property.user_id : null);
+      } catch (smsError) {
+        console.error(`Rent reminder SMS to tenant ${tenant.id} failed:`, smsError.message);
+      }
+    }
+  } catch (err) {
+    console.error('sendDueRentReminders failed:', err.message);
+  }
+}
+
+if (RENT_REMINDERS_ENABLED) {
+  cron.schedule('0 9 * * *', sendDueRentReminders);
 }
 
 // ============================================

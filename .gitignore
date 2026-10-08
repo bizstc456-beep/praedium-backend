@@ -4,3 +4,7 @@ node_modules/
 .DS_Store
 npm-debug.log*
 *.bak
+
+# Scratch/dev-only scripts, never meant to ship
+_seed_demo_data.js
+_seed_inspect.js
