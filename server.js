@@ -39,18 +39,31 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
 
-// Allowed origins for browser requests. Set FRONTEND_URL on Railway to the
-// deployed frontend's origin; localhost is always allowed for local dev.
-const allowedOrigins = [
-  process.env.FRONTEND_URL || 'https://www.praedium.pro',
-  'http://localhost:3000',
-];
+// Allowed origins for browser requests. FRONTEND_URL can be a single origin
+// or a comma-separated list (e.g. if the site is reachable at both the www
+// and apex domain). Both the www and apex praedium.pro variants are allowed
+// by default so a DNS/Vercel domain change doesn't silently break CORS, and
+// a trailing slash on any configured origin is tolerated. localhost is
+// always allowed for local dev.
+const allowedOrigins = (process.env.FRONTEND_URL || 'https://www.praedium.pro,https://praedium.pro')
+  .split(',')
+  .map((o) => o.trim().replace(/\/$/, ''))
+  .concat(['http://localhost:3000']);
+
 app.use(cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (curl, mobile apps, server-to-server, Stripe webhooks)
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (!origin) {
       return callback(null, true);
     }
+    const normalizedOrigin = origin.replace(/\/$/, '');
+    if (allowedOrigins.includes(normalizedOrigin)) {
+      return callback(null, true);
+    }
+    // Log the actual rejected origin so a mismatch (wrong domain, http vs
+    // https, a Vercel preview URL) is visible in Railway logs instead of
+    // just "Not allowed by CORS" with no context.
+    console.error(`CORS rejected origin: "${origin}" (allowed: ${allowedOrigins.join(', ')})`);
     return callback(new Error('Not allowed by CORS'));
   },
 }));
