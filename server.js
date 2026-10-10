@@ -2636,10 +2636,25 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
 // HELPER FUNCTIONS
 // ============================================
 
+// Claude's response "content" is an array of blocks, and not every block is
+// guaranteed to be plain text (e.g. a leading block of a different type) --
+// blindly reading content[0].text can silently come back undefined, which
+// then gets sent to Twilio as an empty message body and rejected (error
+// 21602 "Message body is required") with no useful trace back to the real
+// cause. Pull out the first actual text block instead, and surface a clear
+// error if the model didn't return one so it shows up plainly in the logs.
+function extractClaudeText(response) {
+  const textBlock = (response.content || []).find((block) => block.type === 'text' && block.text);
+  if (!textBlock) {
+    throw new Error(`Claude returned no usable text content (stop_reason: ${response.stop_reason})`);
+  }
+  return textBlock.text;
+}
+
 async function generateWelcomeMessage(tenantName, propertyAddress, unitLabel) {
   const message = await anthropic.messages.create({
     model: 'claude-opus-5',
-    max_tokens: 100,
+    max_tokens: 300,
     messages: [
       {
         role: 'user',
@@ -2648,13 +2663,13 @@ async function generateWelcomeMessage(tenantName, propertyAddress, unitLabel) {
     ]
   });
 
-  return message.content[0].text;
+  return extractClaudeText(message);
 }
 
 async function generatePaymentConfirmationMessage(tenantName, amount) {
   const message = await anthropic.messages.create({
     model: 'claude-opus-5',
-    max_tokens: 100,
+    max_tokens: 300,
     messages: [
       {
         role: 'user',
@@ -2663,7 +2678,7 @@ async function generatePaymentConfirmationMessage(tenantName, amount) {
     ]
   });
 
-  return message.content[0].text;
+  return extractClaudeText(message);
 }
 
 // Twilio requires E.164 format (+1XXXXXXXXXX) for the "to" number. The
@@ -2683,6 +2698,9 @@ function toE164(phone) {
 }
 
 async function sendSMS(phone, message, user_id) {
+  if (!message || !String(message).trim()) {
+    throw new Error('sendSMS called with an empty message body -- refusing to call Twilio');
+  }
   try {
     const toPhone = toE164(phone);
     const result = await twilioClient.messages.create({
