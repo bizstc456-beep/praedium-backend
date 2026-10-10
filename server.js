@@ -2666,12 +2666,29 @@ async function generatePaymentConfirmationMessage(tenantName, amount) {
   return message.content[0].text;
 }
 
+// Twilio requires E.164 format (+1XXXXXXXXXX) for the "to" number. The
+// tenant/property forms just take whatever digits someone types, so a plain
+// 10-digit North American number (the common case for Canadian/US phones)
+// needs "+1" added, or it's silently rejected by Twilio. If it's already
+// E.164 (starts with "+") or doesn't match a recognizable NANP shape, it's
+// passed through unchanged and Twilio will raise its own clear error.
+function toE164(phone) {
+  if (!phone) return phone;
+  const trimmed = String(phone).trim();
+  if (trimmed.startsWith('+')) return trimmed;
+  const digits = trimmed.replace(/\D/g, '');
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith('1')) return `+${digits}`;
+  return trimmed;
+}
+
 async function sendSMS(phone, message, user_id) {
   try {
+    const toPhone = toE164(phone);
     const result = await twilioClient.messages.create({
       body: message,
       from: process.env.TWILIO_PHONE_NUMBER,
-      to: phone
+      to: toPhone
     });
 
     await supabase
@@ -2679,7 +2696,7 @@ async function sendSMS(phone, message, user_id) {
       .insert([
         {
           user_id,
-          to_phone: phone,
+          to_phone: toPhone,
           message,
           status: result.status,
           twilio_sid: result.sid,
