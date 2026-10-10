@@ -2654,7 +2654,14 @@ function extractClaudeText(response) {
 async function generateWelcomeMessage(tenantName, propertyAddress, unitLabel) {
   const message = await anthropic.messages.create({
     model: 'claude-opus-5',
-    max_tokens: 300,
+    // claude-opus-5 reasons adaptively by default, and that reasoning counts
+    // against max_tokens -- for a short, simple task like a one-sentence SMS
+    // it can burn the whole budget thinking and leave nothing for the actual
+    // text (stop_reason: "max_tokens" with no usable content). "low" effort
+    // keeps it from over-thinking a trivial prompt, and 1024 leaves headroom
+    // even if it reasons a little anyway.
+    max_tokens: 1024,
+    output_config: { effort: 'low' },
     messages: [
       {
         role: 'user',
@@ -2669,7 +2676,14 @@ async function generateWelcomeMessage(tenantName, propertyAddress, unitLabel) {
 async function generatePaymentConfirmationMessage(tenantName, amount) {
   const message = await anthropic.messages.create({
     model: 'claude-opus-5',
-    max_tokens: 300,
+    // claude-opus-5 reasons adaptively by default, and that reasoning counts
+    // against max_tokens -- for a short, simple task like a one-sentence SMS
+    // it can burn the whole budget thinking and leave nothing for the actual
+    // text (stop_reason: "max_tokens" with no usable content). "low" effort
+    // keeps it from over-thinking a trivial prompt, and 1024 leaves headroom
+    // even if it reasons a little anyway.
+    max_tokens: 1024,
+    output_config: { effort: 'low' },
     messages: [
       {
         role: 'user',
