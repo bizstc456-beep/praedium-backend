@@ -569,6 +569,19 @@ app.post('/api/tenants', requireAuth, async (req, res) => {
       console.error('Welcome SMS failed:', smsError);
     }
 
+    // Same automation chain: if an email was given, send the portal invite
+    // right away too instead of making the landlord click "Invite to
+    // Portal" as a separate step. Best-effort, same as the SMS above -- no
+    // email on file just means this is skipped (the manual button still
+    // works later once one's added).
+    if (newTenant.email) {
+      try {
+        await inviteTenantToPortal(newTenant);
+      } catch (inviteError) {
+        console.error('Automatic portal invite failed:', inviteError);
+      }
+    }
+
     res.json({ success: true, tenant: newTenant });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -1556,6 +1569,36 @@ app.delete('/api/documents/:document_id', requireAuth, async (req, res) => {
 const MAINTENANCE_STATUSES = ['open', 'in_progress', 'resolved'];
 
 // Invite a tenant you manage to create their portal login
+// Sends the Supabase portal-invite email to a tenant and records the
+// resulting auth_user_id. Shared by the manual "Invite to Portal" button
+// and the automatic invite fired when a tenant/lease is created with an
+// email on file. Throws on failure -- callers decide how to handle that
+// (an HTTP error response for the manual route, a logged no-op for the
+// automatic one).
+async function inviteTenantToPortal(tenant) {
+  const frontendUrl = process.env.FRONTEND_URL || 'https://www.praedium.pro';
+
+  const { data: inviteData, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(
+    tenant.email,
+    { redirectTo: `${frontendUrl}/tenant/set-password` }
+  );
+
+  if (inviteError) {
+    throw new Error(inviteError.message);
+  }
+
+  const { error: updateError } = await supabase
+    .from('tenants')
+    .update({ auth_user_id: inviteData.user.id, invited_at: new Date() })
+    .eq('id', tenant.id);
+
+  if (updateError) {
+    throw new Error(updateError.message);
+  }
+
+  return inviteData.user.id;
+}
+
 app.post('/api/tenants/:tenant_id/invite', requireAuth, async (req, res) => {
   try {
     const { tenant_id } = req.params;
@@ -1590,25 +1633,7 @@ app.post('/api/tenants/:tenant_id/invite', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'This tenant already has a portal account' });
     }
 
-    const frontendUrl = process.env.FRONTEND_URL || 'https://www.praedium.pro';
-
-    const { data: inviteData, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(
-      tenant.email,
-      { redirectTo: `${frontendUrl}/tenant/set-password` }
-    );
-
-    if (inviteError) {
-      return res.status(400).json({ error: inviteError.message });
-    }
-
-    const { error: updateError } = await supabase
-      .from('tenants')
-      .update({ auth_user_id: inviteData.user.id, invited_at: new Date() })
-      .eq('id', tenant_id);
-
-    if (updateError) {
-      return res.status(400).json({ error: updateError.message });
-    }
+    await inviteTenantToPortal(tenant);
 
     res.json({ success: true });
   } catch (error) {
