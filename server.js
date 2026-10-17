@@ -2,22 +2,52 @@
 // FILE: server.js - PRAEDIUM BACKEND
 // ============================================
 
+const dotenv = require('dotenv');
+
+// Load .env only in development, not in production (Railway)
+if (process.env.NODE_ENV !== 'production') {
+  dotenv.config();
+}
+
+// Sentry must be required and initialized before express (and the other
+// libraries below) are required, so its auto-instrumentation can patch
+// them. Safe to leave running everywhere -- with no SENTRY_DSN set (e.g. a
+// local dev machine that doesn't have one), it quietly no-ops instead of
+// throwing. Its default integrations already cover uncaught exceptions and
+// unhandled promise rejections (an async route handler that throws without
+// a try/catch, which would otherwise just crash the process with nothing
+// to show for it), on top of the explicit capture below.
+const Sentry = require('@sentry/node');
+Sentry.init({
+  dsn: process.env.SENTRY_DSN,
+  environment: process.env.NODE_ENV || 'development',
+  tracesSampleRate: 0.1,
+});
+
+// Every catch block in this file already does `console.error(message, err)`
+// -- forward those to Sentry too, so a bug shows up as an event instead of
+// only existing in Railway's logs until a customer complains.
+const originalConsoleError = console.error.bind(console);
+console.error = (...args) => {
+  originalConsoleError(...args);
+  const error = args.find((a) => a instanceof Error);
+  if (error) {
+    Sentry.captureException(error);
+  } else {
+    Sentry.captureMessage(args.map(String).join(' '), 'error');
+  }
+};
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const dotenv = require('dotenv');
 const { createClient } = require('@supabase/supabase-js');
 const Stripe = require('stripe');
 const twilio = require('twilio');
 const Anthropic = require('@anthropic-ai/sdk');
 const multer = require('multer');
 const cron = require('node-cron');
-
-// Load .env only in development, not in production (Railway)
-if (process.env.NODE_ENV !== 'production') {
-  dotenv.config();
-}
 
 // ============================================
 // INITIALIZE ALL SERVICES
