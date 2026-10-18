@@ -3121,7 +3121,8 @@ app.use((err, req, res, next) => {
 // manually, rather than hard-deleting on the spot.
 
 app.get('/api/account/export', requireAuth, async (req, res) => {
-  try {
+    try {
+      console.log('EXPORT DEBUG: req.user.id =', JSON.stringify(req.user.id));
     const { data: account, error: accountError } = await supabase
       .from('customers')
       .select('*')
