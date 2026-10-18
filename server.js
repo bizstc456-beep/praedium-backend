@@ -2675,12 +2675,31 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
 
     if (event.type === 'invoice.payment_failed') {
       const invoice = event.data.object;
-      await supabase
+      const { data: customerRow } = await supabase
         .from('customers')
         .update({ subscription_status: 'past_due' })
-        .eq('stripe_customer_id', invoice.customer);
-    }
+        .eq('stripe_customer_id', invoice.customer)
+        .select('user_id, email')
+        .single();
 
+      // Proactive alert so a failed payment doesn't just sit quietly on the
+      // admin dashboard until someone happens to look. Wrapped in its own
+      // try/catch -- an SMS failure here should never break the webhook ack
+      // back to Stripe (which would otherwise just retry and re-fail).
+      if (process.env.OWNER_PHONE_NUMBER) {
+        try {
+          const amount = ((invoice.amount_due || 0) / 100).toFixed(2);
+          const who = customerRow?.email || invoice.customer_email || invoice.customer;
+          await sendSMS(
+            process.env.OWNER_PHONE_NUMBER,
+            `Praedium billing alert: payment failed for ${who} ($${amount}). Subscription is now past_due.`,
+            customerRow?.user_id || null
+          );
+        } catch (smsErr) {
+          console.error('Failed to send past_due SMS alert', smsErr);
+        }
+      }
+    }
     res.json({ received: true });
   } catch (error) {
     res.status(400).json({ error: error.message });
