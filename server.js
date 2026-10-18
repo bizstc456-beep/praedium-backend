@@ -3110,6 +3110,112 @@ app.use((err, req, res, next) => {
 // START SERVER
 // ============================================
 
+// ============================================================
+// ACCOUNT DATA EXPORT & DELETION (Law 25 / PIPEDA)
+// ============================================================
+// Self-service "right to access" and "right to erasure" for landlords.
+// Export returns everything Praedium holds about the landlord's own
+// account (not their properties/tenants/leases -- account-level only).
+// Deletion is a request + grace period, not instant: we flag the
+// account and notify the founder so it can be reviewed/actioned
+// manually, rather than hard-deleting on the spot.
+
+app.get('/api/account/export', requireAuth, async (req, res) => {
+  try {
+    const { data: account, error: accountError } = await supabase
+      .from('customers')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (accountError) {
+      console.error('Account export: failed to load customer row', accountError);
+      return res.status(500).json({ error: 'Failed to generate export' });
+    }
+
+    const { data: smsHistory, error: smsError } = await supabase
+      .from('sms_messages')
+      .select('*')
+      .eq('user_id', req.user.id)
+      .order('created_at', { ascending: false });
+
+    if (smsError) {
+      console.error('Account export: failed to load sms_messages', smsError);
+      return res.status(500).json({ error: 'Failed to generate export' });
+    }
+
+    const payload = {
+      export_generated_at: new Date().toISOString(),
+      account,
+      sms_history: smsHistory || []
+    };
+
+    const filename = `praedium-account-export-${new Date().toISOString().slice(0, 10)}.json`;
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    return res.status(200).send(JSON.stringify(payload, null, 2));
+  } catch (err) {
+    console.error('Account export error', err);
+    return res.status(500).json({ error: 'Failed to generate export' });
+  }
+});
+
+app.post('/api/account/delete-request', requireAuth, async (req, res) => {
+  try {
+    const { data: existing, error: fetchError } = await supabase
+      .from('customers')
+      .select('user_id, email, name, deletion_requested_at')
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (fetchError || !existing) {
+      console.error('Delete request: failed to load customer row', fetchError);
+      return res.status(500).json({ error: 'Failed to submit deletion request' });
+    }
+
+    if (existing.deletion_requested_at) {
+      return res.status(200).json({
+        success: true,
+        already_requested: true,
+        deletion_requested_at: existing.deletion_requested_at
+      });
+    }
+
+    const requestedAt = new Date().toISOString();
+    const { error: updateError } = await supabase
+      .from('customers')
+      .update({ deletion_requested_at: requestedAt })
+      .eq('user_id', req.user.id);
+
+    if (updateError) {
+      console.error('Delete request: failed to update customer row', updateError);
+      return res.status(500).json({ error: 'Failed to submit deletion request' });
+    }
+
+    if (process.env.OWNER_PHONE_NUMBER) {
+      try {
+        const who = existing.email || existing.name || req.user.id;
+        await sendSMS(
+          process.env.OWNER_PHONE_NUMBER,
+          `Praedium: account deletion requested by ${who}. Review within the grace period.`,
+          req.user.id
+        );
+      } catch (smsErr) {
+        console.error('Failed to send deletion-request SMS alert', smsErr);
+      }
+    }
+
+    return res.status(200).json({
+      success: true,
+      already_requested: false,
+      deletion_requested_at: requestedAt
+    });
+  } catch (err) {
+    console.error('Delete request error', err);
+    return res.status(500).json({ error: 'Failed to submit deletion request' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 if (require.main === module) {
   app.listen(PORT, () => {
