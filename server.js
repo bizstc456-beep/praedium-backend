@@ -2545,65 +2545,7 @@ app.post('/api/create-checkout-session', requireAuth, async (req, res) => {
   }
 });
 
-// Create subscription
-app.post('/api/billing/subscribe', requireAuth, async (req, res) => {
-  try {
-    const { customer_id, email, payment_method_id } = req.body;
 
-    if (!customer_id || !payment_method_id) {
-      return res.status(400).json({ error: 'customer_id and payment_method_id are required' });
-    }
-
-    const { data: customerRow, error: customerLookupError } = await supabase
-      .from('customers')
-      .select('user_id')
-      .eq('id', customer_id)
-      .single();
-    if (customerLookupError || !customerRow) {
-      return res.status(404).json({ error: 'Customer not found' });
-    }
-
-    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
-    if (customerRow.user_id !== req.user.id && !isAdmin) {
-      return res.status(403).json({ error: 'This billing account does not belong to you' });
-    }
-
-    const stripeCustomer = await stripe.customers.create({
-      email,
-      payment_method: payment_method_id,
-      invoice_settings: {
-        default_payment_method: payment_method_id
-      }
-    });
-
-    const subscription = await stripe.subscriptions.create({
-      customer: stripeCustomer.id,
-      items: [{
-        price: process.env.STRIPE_PRICE_ID
-      }],
-      payment_settings: {
-        payment_method_types: ['card']
-      }
-    });
-
-    await supabase
-      .from('customers')
-      .update({
-        stripe_customer_id: stripeCustomer.id,
-        stripe_subscription_id: subscription.id,
-        subscription_status: 'active'
-      })
-      .eq('id', customer_id);
-
-    res.json({
-      success: true,
-      subscription: subscription,
-      client_secret: subscription.latest_invoice?.payment_intent?.client_secret
-    });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
 
 // Get billing history
 app.get('/api/billing/invoices/:customer_id', requireAuth, async (req, res) => {
