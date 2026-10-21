@@ -3120,6 +3120,55 @@ app.use((err, req, res, next) => {
 // account and notify the founder so it can be reviewed/actioned
 // manually, rather than hard-deleting on the spot.
 
+app.get('/api/account', requireAuth, async (req, res) => {
+  try {
+    const { data: account, error: accountError } = await supabase
+      .from('customers')
+      .select('name, email, phone')
+      .eq('user_id', req.user.id)
+      .single();
+
+    if (accountError) {
+      console.error('Account fetch: failed to load customer row', accountError);
+      return res.status(500).json({ error: 'Failed to load account' });
+    }
+
+    return res.status(200).json(account);
+  } catch (err) {
+    console.error('Account fetch error', err);
+    return res.status(500).json({ error: 'Failed to load account' });
+  }
+});
+
+app.put('/api/account', requireAuth, async (req, res) => {
+  try {
+    const { phone } = req.body;
+
+    if (phone) {
+      const digitsOnly = String(phone).replace(/[^\d+]/g, '');
+      if (digitsOnly.replace(/^\+/, '').length < 10) {
+        return res.status(400).json({ error: 'Please enter a valid phone number' });
+      }
+    }
+
+    const { data: account, error: updateError } = await supabase
+      .from('customers')
+      .update({ phone: phone || null })
+      .eq('user_id', req.user.id)
+      .select('name, email, phone')
+      .single();
+
+    if (updateError) {
+      console.error('Account update: failed to save phone', updateError);
+      return res.status(500).json({ error: 'Failed to save phone number' });
+    }
+
+    return res.status(200).json(account);
+  } catch (err) {
+    console.error('Account update error', err);
+    return res.status(500).json({ error: 'Failed to save phone number' });
+  }
+});
 app.get('/api/account/export', requireAuth, async (req, res) => {
     try {
     const { data: account, error: accountError } = await supabase
