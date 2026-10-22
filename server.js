@@ -2471,7 +2471,7 @@ app.get('/api/billing/plan/:user_id', requireAuth, async (req, res) => {
 
     const { data: customer } = await supabase
       .from('customers')
-      .select('plan_tier, subscription_status')
+      .select('plan_tier, subscription_status, cancel_at_period_end, current_period_end')
       .eq('user_id', user_id)
       .single();
 
@@ -2492,7 +2492,9 @@ app.get('/api/billing/plan/:user_id', requireAuth, async (req, res) => {
       max_units: tier.maxUnits === Infinity ? null : tier.maxUnits,
       current_units: currentUnits,
       subscription_status: subscriptionStatus,
-      has_subscription: hasSubscription
+      has_subscription: hasSubscription,
+      cancel_at_period_end: customer ? Boolean(customer.cancel_at_period_end) : false,
+      current_period_end: customer ? customer.current_period_end : null
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -2542,6 +2544,137 @@ app.post('/api/create-checkout-session', requireAuth, async (req, res) => {
   } catch (error) {
     console.error('Create checkout session error:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Switch an existing subscriber to a different tier (upgrade or downgrade).
+// Unlike create-checkout-session, this modifies the existing Stripe
+// subscription in place rather than starting a second one.
+app.post('/api/billing/change-plan', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const tierKey = req.body.tier;
+
+    if (!isValidTierKey(tierKey)) {
+      return res.status(400).json({ error: `tier is required and must be one of: ${Object.keys(PLAN_TIERS).join(', ')}` });
+    }
+
+    const { data: customer } = await supabase
+      .from('customers')
+      .select('stripe_subscription_id, plan_tier')
+      .eq('user_id', userId)
+      .single();
+
+    if (!customer?.stripe_subscription_id) {
+      return res.status(400).json({ error: 'No active subscription found. Start a trial first.' });
+    }
+
+    if (customer.plan_tier === tierKey) {
+      return res.status(400).json({ error: 'You are already on this plan' });
+    }
+
+    const tier = PLAN_TIERS[tierKey];
+    const newPriceId = process.env[tier.priceEnvVar];
+    if (!newPriceId) {
+      return res.status(500).json({ error: `${tier.priceEnvVar} is not configured on the server` });
+    }
+
+    const subscription = await stripe.subscriptions.retrieve(customer.stripe_subscription_id);
+    const itemId = subscription.items.data[0]?.id;
+    if (!itemId) {
+      return res.status(500).json({ error: 'Could not find subscription item to update' });
+    }
+
+    const updated = await stripe.subscriptions.update(customer.stripe_subscription_id, {
+      items: [{ id: itemId, price: newPriceId }],
+      proration_behavior: 'create_prorations',
+      cancel_at_period_end: false,
+    });
+
+    await supabase
+      .from('customers')
+      .update({
+        plan_tier: tierKey,
+        cancel_at_period_end: false,
+        current_period_end: updated.current_period_end
+          ? new Date(updated.current_period_end * 1000).toISOString()
+          : null,
+      })
+      .eq('user_id', userId);
+
+    return res.json({ success: true, plan_tier: tierKey });
+  } catch (error) {
+    console.error('Change plan error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Cancel at period end -- the landlord keeps full access until the date
+// they already paid through, then the subscription actually ends (handled
+// by the customer.subscription.deleted webhook below).
+app.post('/api/billing/cancel', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { data: customer } = await supabase
+      .from('customers')
+      .select('stripe_subscription_id')
+      .eq('user_id', userId)
+      .single();
+
+    if (!customer?.stripe_subscription_id) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+
+    const updated = await stripe.subscriptions.update(customer.stripe_subscription_id, {
+      cancel_at_period_end: true,
+    });
+
+    const periodEnd = updated.current_period_end
+      ? new Date(updated.current_period_end * 1000).toISOString()
+      : null;
+
+    await supabase
+      .from('customers')
+      .update({ cancel_at_period_end: true, current_period_end: periodEnd })
+      .eq('user_id', userId);
+
+    return res.json({ success: true, current_period_end: periodEnd });
+  } catch (error) {
+    console.error('Cancel subscription error:', error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Undo a pending cancellation -- lets someone change their mind before
+// their period actually ends.
+app.post('/api/billing/resume', requireAuth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { data: customer } = await supabase
+      .from('customers')
+      .select('stripe_subscription_id')
+      .eq('user_id', userId)
+      .single();
+
+    if (!customer?.stripe_subscription_id) {
+      return res.status(400).json({ error: 'No active subscription found' });
+    }
+
+    await stripe.subscriptions.update(customer.stripe_subscription_id, {
+      cancel_at_period_end: false,
+    });
+
+    await supabase
+      .from('customers')
+      .update({ cancel_at_period_end: false })
+      .eq('user_id', userId);
+
+    return res.json({ success: true });
+  } catch (error) {
+    console.error('Resume subscription error:', error);
+    return res.status(500).json({ error: error.message });
   }
 });
 
@@ -2641,6 +2774,32 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
           console.error('Failed to send past_due SMS alert', smsErr);
         }
       }
+    }
+    if (event.type === 'customer.subscription.updated' || event.type === 'customer.subscription.deleted') {
+      const subscription = event.data.object;
+
+      const updates = {
+        subscription_status: event.type === 'customer.subscription.deleted' ? 'canceled' : subscription.status,
+        cancel_at_period_end: Boolean(subscription.cancel_at_period_end),
+        current_period_end: subscription.current_period_end
+          ? new Date(subscription.current_period_end * 1000).toISOString()
+          : null,
+      };
+
+      // Keep plan_tier in sync in case the plan was changed directly in the
+      // Stripe dashboard rather than through /api/billing/change-plan.
+      const priceId = subscription.items?.data?.[0]?.price?.id;
+      if (priceId) {
+        const matchedTierKey = Object.keys(PLAN_TIERS).find(
+          (key) => process.env[PLAN_TIERS[key].priceEnvVar] === priceId
+        );
+        if (matchedTierKey) updates.plan_tier = matchedTierKey;
+      }
+
+      await supabase
+        .from('customers')
+        .update(updates)
+        .eq('stripe_subscription_id', subscription.id);
     }
     res.json({ received: true });
   } catch (error) {
@@ -3170,7 +3329,7 @@ app.put('/api/account', requireAuth, async (req, res) => {
   }
 });
 app.get('/api/account/export', requireAuth, async (req, res) => {
-    try {
+  try {
     const { data: account, error: accountError } = await supabase
       .from('customers')
       .select('*')
