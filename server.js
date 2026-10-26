@@ -3424,6 +3424,21 @@ app.post('/api/account/delete-request', requireAuth, async (req, res) => {
   }
 });
 
+// Upload errors (e.g. a file over the multer size limit) are thrown by
+// the upload.single(...) middleware before a route's own try/catch runs,
+// so without this they fall through as a bare 500. Catch them here with
+// a clear, user-facing message instead.
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({ error: 'File is too large. Maximum size is 15MB.' });
+    }
+    return res.status(400).json({ error: err.message });
+  }
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Something went wrong. Please try again.' });
+});
+
 const PORT = process.env.PORT || 3000;
 if (require.main === module) {
   app.listen(PORT, () => {
