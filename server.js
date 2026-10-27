@@ -1313,14 +1313,18 @@ app.get('/api/insights/:user_id', requireAuth, async (req, res) => {
     const tenantList = tenants || [];
     const tenantIds = tenantList.map(t => t.id);
 
-    // Last 6 calendar months, oldest to newest, including the current
-    // (partial) month.
+    // Last N calendar months, oldest to newest, including the current
+    // (partial) month. N comes from ?months= (3, 6, or 12; default 6).
+    const allowedMonthRanges = [3, 6, 12];
+    const requestedMonths = parseInt(req.query.months, 10);
+    const monthsCount = allowedMonthRanges.includes(requestedMonths) ? requestedMonths : 6;
     const now = new Date();
     const months = [];
-    for (let i = 5; i >= 0; i--) {
+    for (let i = monthsCount - 1; i >= 0; i--) {
       const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
       months.push({ year: d.getFullYear(), month: d.getMonth(), label: d.toLocaleString('en-US', { month: 'short' }) });
     }
+
     const windowStart = new Date(months[0].year, months[0].month, 1).toISOString().slice(0, 10);
     const windowEnd = new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10);
 
