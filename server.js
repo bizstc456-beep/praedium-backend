@@ -839,6 +839,58 @@ app.post('/api/payments/mark-paid', requireAuth, async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+// Cancel the most recently recorded payment for a tenant you manage
+app.delete('/api/payments/:tenant_id/latest', requireAuth, async (req, res) => {
+  try {
+    const { tenant_id } = req.params;
+
+    const { data: tenantData, error: tenantError } = await supabase
+      .from('tenants')
+      .select('property_id')
+      .eq('id', tenant_id)
+      .single();
+    if (tenantError || !tenantData) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const { data: property, error: propertyError } = await supabase
+      .from('properties')
+      .select('user_id')
+      .eq('id', tenantData.property_id)
+      .single();
+    if (propertyError || !property) {
+      return res.status(404).json({ error: 'Property not found for this tenant' });
+    }
+
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (property.user_id !== req.user.id && !isAdmin) {
+      return res.status(403).json({ error: 'You do not manage this tenant' });
+    }
+
+    const { data: latestPayment, error: latestError } = await supabase
+      .from('payments')
+      .select('id')
+      .eq('tenant_id', tenant_id)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+    if (latestError || !latestPayment) {
+      return res.status(404).json({ error: 'No payment found to cancel' });
+    }
+
+    const { error: deleteError } = await supabase
+      .from('payments')
+      .delete()
+      .eq('id', latestPayment.id);
+    if (deleteError) {
+      return res.status(400).json({ error: deleteError.message });
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
 
 // Get payment history for a tenant you manage
 app.get('/api/payments/:tenant_id', requireAuth, async (req, res) => {
