@@ -184,8 +184,43 @@ const anthropic = new Anthropic({
 });
 
 // File uploads (documents) -- held in memory, then streamed to Supabase
-// Storage. 15MB cap covers scanned leases/IDs comfortably.
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
+// Storage. 15MB cap covers scanned leases/IDs comfortably. fileFilter keeps
+// this to the document/photo types the app actually handles -- an upload
+// endpoint with no type check will happily store an .html or .svg file,
+// which is a real (if modest) risk once it's handed back out via a signed
+// URL and opened in a browser tab.
+const DOCUMENT_MIME_TYPES = new Set([
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+  'image/heic',
+  'image/heif',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+]);
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (DOCUMENT_MIME_TYPES.has(file.mimetype)) return cb(null, true);
+    const err = new Error('Unsupported file type. Upload a PDF, Word document, or image.');
+    err.isFileFilterError = true;
+    cb(err);
+  },
+});
+
+// Narrower variant for the tenant maintenance-request photo -- images only.
+const uploadImage = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith('image/')) return cb(null, true);
+    const err = new Error('Unsupported file type. Upload an image.');
+    err.isFileFilterError = true;
+    cb(err);
+  },
+});
 
 // ============================================
 // AUTH HELPERS
@@ -1812,7 +1847,7 @@ app.get('/api/tenant-portal/maintenance', requireTenantAuth, async (req, res) =>
 // Tenant portal: submit a new maintenance request. Accepts multipart/form-data
 // (title, description, and an optional 'photo' file) so a tenant can attach a
 // picture of the issue -- plain JSON with no photo still works the same way.
-app.post('/api/tenant-portal/maintenance', requireTenantAuth, upload.single('photo'), async (req, res) => {
+app.post('/api/tenant-portal/maintenance', requireTenantAuth, uploadImage.single('photo'), async (req, res) => {
   try {
     const { title, description } = req.body;
     if (!title) {
@@ -2469,6 +2504,23 @@ app.get('/api/sms/templates', requireAuth, async (req, res) => {
 // "A message comes in" webhook (Twilio Console -> Phone Numbers -> your number).
 app.post('/api/webhooks/twilio/inbound', express.urlencoded({ extended: false }), async (req, res) => {
   try {
+    // Twilio signs every webhook request with X-Twilio-Signature so we can
+    // confirm it actually came from Twilio -- without this, anyone who finds
+    // this URL could POST a fake "From"/"Body" and have it recorded as an
+    // inbound tenant message.
+    const twilioSignature = req.headers['x-twilio-signature'];
+    const webhookUrl = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+    const isValidTwilioRequest = twilio.validateRequest(
+      process.env.TWILIO_AUTH_TOKEN,
+      twilioSignature,
+      webhookUrl,
+      req.body
+    );
+    if (!isValidTwilioRequest) {
+      console.error('Twilio inbound webhook: signature validation failed, rejecting request');
+      return res.status(403).send('Forbidden');
+    }
+
     const from = req.body.From;
     const body = req.body.Body || '';
     const messageSid = req.body.MessageSid;
@@ -2527,7 +2579,7 @@ app.get('/api/billing/plan/:user_id', requireAuth, async (req, res) => {
 
     const { data: customer } = await supabase
       .from('customers')
-      .select('plan_tier, subscription_status, cancel_at_period_end, current_period_end')
+      .select('plan_tier, subscription_status, cancel_at_period_end, current_period_end, trial_ends_at')
       .eq('user_id', user_id)
       .single();
 
@@ -2550,7 +2602,8 @@ app.get('/api/billing/plan/:user_id', requireAuth, async (req, res) => {
       subscription_status: subscriptionStatus,
       has_subscription: hasSubscription,
       cancel_at_period_end: customer ? Boolean(customer.cancel_at_period_end) : false,
-      current_period_end: customer ? customer.current_period_end : null
+      current_period_end: customer ? customer.current_period_end : null,
+      trial_ends_at: customer ? customer.trial_ends_at : null
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -2810,8 +2863,10 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
         .from('customers')
         .update({ subscription_status: 'past_due' })
         .eq('stripe_customer_id', invoice.customer)
-        .select('user_id, email')
+        .select('user_id, email, phone, name')
         .single();
+
+      const amount = ((invoice.amount_due || 0) / 100).toFixed(2);
 
       // Proactive alert so a failed payment doesn't just sit quietly on the
       // admin dashboard until someone happens to look. Wrapped in its own
@@ -2819,7 +2874,6 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
       // back to Stripe (which would otherwise just retry and re-fail).
       if (process.env.OWNER_PHONE_NUMBER) {
         try {
-          const amount = ((invoice.amount_due || 0) / 100).toFixed(2);
           const who = customerRow?.email || invoice.customer_email || invoice.customer;
           await sendSMS(
             process.env.OWNER_PHONE_NUMBER,
@@ -2828,6 +2882,22 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
           );
         } catch (smsErr) {
           console.error('Failed to send past_due SMS alert', smsErr);
+        }
+      }
+
+      // Also let the customer themselves know -- otherwise the only way
+      // they'd find out is by noticing a feature stopped working.
+      if (customerRow?.phone) {
+        try {
+          const frontendUrl = process.env.FRONTEND_URL || 'https://www.praedium.pro';
+          const firstName = (customerRow.name || '').split(' ')[0] || 'there';
+          await sendSMS(
+            customerRow.phone,
+            `Hi ${firstName}, your Praedium payment of $${amount} didn't go through. Please update your payment method at ${frontendUrl}/payment to keep your account active.`,
+            customerRow.user_id || null
+          );
+        } catch (smsErr) {
+          console.error('Failed to send past_due SMS to customer', smsErr);
         }
       }
     }
@@ -3486,6 +3556,9 @@ app.use((err, req, res, next) => {
     if (err.code === 'LIMIT_FILE_SIZE') {
       return res.status(413).json({ error: 'File is too large. Maximum size is 15MB.' });
     }
+    return res.status(400).json({ error: err.message });
+  }
+  if (err && err.isFileFilterError) {
     return res.status(400).json({ error: err.message });
   }
   console.error('Unhandled error:', err);
