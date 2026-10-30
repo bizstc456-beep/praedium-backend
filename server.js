@@ -146,6 +146,38 @@ const {
   resolveTierKey,
 } = require('./lib/planLogic');
 
+// Monthly price per tier, fetched live from Stripe rather than hardcoded --
+// the actual dollar amounts only ever live in Stripe (as Price objects
+// referenced by the STRIPE_PRICE_* env vars), so asking Stripe directly
+// means this never drifts out of sync with a price changed in the
+// dashboard. Cached in memory for a few minutes since prices essentially
+// never change between requests and this is called on every admin
+// dashboard load.
+let tierPriceCache = { fetchedAt: 0, prices: null };
+async function getTierMonthlyPrices() {
+  const CACHE_TTL_MS = 10 * 60 * 1000;
+  if (tierPriceCache.prices && (Date.now() - tierPriceCache.fetchedAt) < CACHE_TTL_MS) {
+    return tierPriceCache.prices;
+  }
+  const prices = {};
+  for (const [tierKey, tier] of Object.entries(PLAN_TIERS)) {
+    const priceId = process.env[tier.priceEnvVar];
+    if (!priceId) {
+      prices[tierKey] = 0;
+      continue;
+    }
+    try {
+      const price = await stripe.prices.retrieve(priceId);
+      prices[tierKey] = (price.unit_amount || 0) / 100;
+    } catch (err) {
+      console.error(`Failed to fetch Stripe price for tier "${tierKey}":`, err.message);
+      prices[tierKey] = 0;
+    }
+  }
+  tierPriceCache = { fetchedAt: Date.now(), prices };
+  return prices;
+}
+
 // Sums inferred unit counts across every property a landlord owns -- the
 // basis for enforcing their plan's unit cap. Safe to call from any route
 // even though inferUnitCount is defined later in this file: routes only
@@ -3290,8 +3322,10 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
 
     const { data: customers, error: customersError } = await supabase
       .from('customers')
-      .select('user_id, email, subscription_status, created_at');
+      .select('user_id, email, subscription_status, plan_tier, trial_ends_at, created_at');
     if (customersError) throw customersError;
+
+    const tierPrices = await getTierMonthlyPrices();
 
     const users = usersPage.users.map(u => ({
       id: u.id,
@@ -3329,15 +3363,47 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
         since: u.created_at,
       }));
 
+    // Only a genuinely past-due or canceled subscription belongs here --
+    // a customer still in their trial isn't a billing issue.
     const billingIssues = (customers || [])
-      .filter(c => c.subscription_status && c.subscription_status !== 'active')
+      .filter(c => c.subscription_status === 'past_due' || c.subscription_status === 'canceled')
       .map(c => ({
         email: c.email,
-        reason: 'payment_failed',
+        reason: c.subscription_status === 'past_due' ? 'payment_failed' : 'canceled',
         since: c.created_at,
       }));
 
     const needsAttention = [...billingIssues, ...stalledOnboarding].slice(0, 8);
+
+    // ---- Subscription revenue: MRR, at-risk revenue, tier breakdown ----
+    // "active" is the only status counted toward real recurring revenue;
+    // "past_due" is still nominally subscribed but not currently paying,
+    // so it's broken out separately as revenue at risk rather than folded
+    // into MRR.
+    const subscriptionStatusCounts = { none: 0, trialing: 0, active: 0, past_due: 0, canceled: 0 };
+    const tierBreakdown = {};
+    Object.keys(PLAN_TIERS).forEach((key) => {
+      tierBreakdown[key] = { label: PLAN_TIERS[key].label, trialing: 0, active: 0, past_due: 0 };
+    });
+
+    let mrr = 0;
+    let atRiskRevenue = 0;
+    (customers || []).forEach((c) => {
+      const status = c.subscription_status || 'none';
+      subscriptionStatusCounts[status] = (subscriptionStatusCounts[status] || 0) + 1;
+
+      if (status === 'trialing' || status === 'active' || status === 'past_due') {
+        const tierKey = resolveTierKey(c.plan_tier);
+        if (tierBreakdown[tierKey]) tierBreakdown[tierKey][status] += 1;
+
+        const price = tierPrices[tierKey] || 0;
+        if (status === 'active') mrr += price;
+        if (status === 'past_due') atRiskRevenue += price;
+      }
+    });
+
+    const activeSubscriberCount = subscriptionStatusCounts.active;
+    const arpu = activeSubscriberCount > 0 ? mrr / activeSubscriberCount : 0;
 
     // ---- Platform activity ----
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -3359,10 +3425,22 @@ app.get('/api/admin/stats', requireAdmin, async (req, res) => {
         totalUsers: users.length,
         totalProperties: properties.length,
         totalTenants: tenants.length,
+        // Rent dollars processed through the platform on behalf of
+        // landlords' tenants -- NOT Praedium's own revenue. See
+        // `subscription` below for actual MRR.
         totalRevenue: payments.reduce((sum, p) => sum + (p.amount || 0), 0),
         paymentsThisMonth,
         maintenanceOpen,
         propertiesThisWeek,
+      },
+      subscription: {
+        mrr,
+        arr: mrr * 12,
+        atRiskRevenue,
+        arpu,
+        activeSubscriberCount,
+        statusCounts: subscriptionStatusCounts,
+        tierBreakdown,
       },
       signupsByWeek,
       needsAttention,
