@@ -365,6 +365,20 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: dbError.message });
     }
 
+    // Onboarding automation: welcome the new landlord by text as soon as
+    // their account exists, mirroring the tenant welcome-SMS flow. Phone is
+    // optional at registration, and this is best-effort -- a failed text
+    // never fails account creation, which has already succeeded by this
+    // point.
+    if (phone) {
+      try {
+        const welcomeMessage = await generateLandlordWelcomeMessage(name);
+        await sendSMS(phone, welcomeMessage, authData.user.id);
+      } catch (smsError) {
+        console.error('Landlord welcome SMS failed:', smsError);
+      }
+    }
+
     res.json({
       success: true,
       customer: customer[0],
@@ -2756,10 +2770,12 @@ app.post('/api/billing/change-plan', requireAuth, async (req, res) => {
 app.post('/api/billing/cancel', requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
+    // Both optional -- a cancellation is never blocked on giving feedback.
+    const { reason, feedback } = req.body || {};
 
     const { data: customer } = await supabase
       .from('customers')
-      .select('stripe_subscription_id')
+      .select('stripe_subscription_id, email, name')
       .eq('user_id', userId)
       .single();
 
@@ -2775,10 +2791,39 @@ app.post('/api/billing/cancel', requireAuth, async (req, res) => {
       ? new Date(updated.current_period_end * 1000).toISOString()
       : null;
 
-    await supabase
+    const { error: cancelUpdateError } = await supabase
       .from('customers')
-      .update({ cancel_at_period_end: true, current_period_end: periodEnd })
+      .update({
+        cancel_at_period_end: true,
+        current_period_end: periodEnd,
+        cancellation_reason: reason || null,
+        cancellation_feedback: feedback || null,
+      })
       .eq('user_id', userId);
+    if (cancelUpdateError) {
+      // The Stripe cancellation above already succeeded -- never fail the
+      // cancellation itself over the reason/feedback not saving. Log it so
+      // it's visible (e.g. the cancellation_reason/cancellation_feedback
+      // columns not existing yet shows up here, not as a silent no-op).
+      console.error('Failed to save cancellation reason/feedback', cancelUpdateError);
+    }
+
+    // Best-effort heads-up to the owner so a cancellation (and why) doesn't
+    // just sit quietly in the database until someone happens to look.
+    if (process.env.OWNER_PHONE_NUMBER) {
+      try {
+        const who = customer.email || customer.name || userId;
+        const reasonPart = reason ? ` Reason: ${reason}.` : '';
+        const feedbackPart = feedback ? ` Feedback: "${feedback}"` : '';
+        await sendSMS(
+          process.env.OWNER_PHONE_NUMBER,
+          `Praedium: ${who} is canceling their subscription.${reasonPart}${feedbackPart}`,
+          userId
+        );
+      } catch (smsErr) {
+        console.error('Failed to send cancellation SMS alert', smsErr);
+      }
+    }
 
     return res.json({ success: true, current_period_end: periodEnd });
   } catch (error) {
@@ -2999,6 +3044,22 @@ async function generateWelcomeMessage(tenantName, propertyAddress, unitLabel) {
       {
         role: 'user',
         content: `Write a brief, friendly SMS welcome message (under 160 characters) to a new tenant whose lease was just created. Tenant name: ${tenantName}. Property: ${propertyAddress || 'their new home'}${unitLabel ? `, unit ${unitLabel}` : ''}. Be warm and professional, and mention they can submit maintenance requests and will get rent reminders through the tenant portal.`
+      }
+    ]
+  });
+
+  return extractClaudeText(message);
+}
+
+async function generateLandlordWelcomeMessage(landlordName) {
+  const message = await anthropic.messages.create({
+    model: 'claude-opus-5',
+    max_tokens: 1024,
+    output_config: { effort: 'low' },
+    messages: [
+      {
+        role: 'user',
+        content: `Write a brief, friendly SMS welcome message (under 160 characters) to a new landlord who just signed up for Praedium, a rental property management app. Landlord name: ${landlordName}. Be warm and professional, and mention they can start by adding their first property.`
       }
     ]
   });
