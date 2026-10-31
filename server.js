@@ -3166,22 +3166,6 @@ function clampDueDay(dueDay, year, month) {
   return Math.min(dueDay, lastDayOfMonth);
 }
 
-async function hasPaymentThisMonth(tenantId, referenceDate) {
-  const startOfMonth = new Date(referenceDate.getFullYear(), referenceDate.getMonth(), 1).toISOString();
-  const { data, error } = await supabase
-    .from('payments')
-    .select('id')
-    .eq('tenant_id', tenantId)
-    .eq('status', 'paid')
-    .gte('payment_date', startOfMonth)
-    .limit(1);
-  if (error) {
-    console.error('hasPaymentThisMonth check failed:', error.message);
-    return false; // fail open toward sending the reminder rather than silently skipping it
-  }
-  return (data || []).length > 0;
-}
-
 async function sendDueRentReminders() {
   if (!RENT_REMINDERS_ENABLED) return;
   try {
@@ -3200,6 +3184,9 @@ async function sendDueRentReminders() {
     const month = today.getMonth();
     const todayDateOnly = new Date(year, month, today.getDate());
 
+    // First pass is pure in-memory date math -- figure out which tenants are
+    // actually due/late today before touching the database at all.
+    const candidates = [];
     for (const tenant of tenants || []) {
       if (!tenant.rent_amount) continue;
 
@@ -3211,16 +3198,52 @@ async function sendDueRentReminders() {
       const isLate = diffDays === 2;
       if (!isUpcoming && !isLate) continue;
 
-      const alreadyPaid = await hasPaymentThisMonth(tenant.id, today);
-      if (alreadyPaid) continue;
+      candidates.push({ tenant, isUpcoming });
+    }
+    if (!candidates.length) return;
+
+    // Batch-fetch this month's paid payments for just the candidate tenants
+    // in one query, instead of one query per tenant.
+    const candidateTenantIds = candidates.map(c => c.tenant.id);
+    const startOfMonth = new Date(year, month, 1).toISOString();
+    const { data: paidData, error: paidError } = await supabase
+      .from('payments')
+      .select('tenant_id')
+      .in('tenant_id', candidateTenantIds)
+      .eq('status', 'paid')
+      .gte('payment_date', startOfMonth);
+    if (paidError) {
+      // Fail open toward sending the reminder rather than silently skipping
+      // it -- paidTenantIds just stays empty below.
+      console.error('Rent reminder payment check failed:', paidError.message);
+    }
+    const paidTenantIds = new Set((paidData || []).map(p => p.tenant_id));
+
+    // Batch-fetch the owning user_id for every referenced property in one
+    // query, instead of one query per tenant.
+    const propertyIds = [...new Set(candidates.map(c => c.tenant.property_id).filter(Boolean))];
+    const ownerByPropertyId = {};
+    if (propertyIds.length) {
+      const { data: propsData, error: propsError } = await supabase
+        .from('properties')
+        .select('id, user_id')
+        .in('id', propertyIds);
+      if (propsError) {
+        console.error('Rent reminder property lookup failed:', propsError.message);
+      }
+      (propsData || []).forEach(p => { ownerByPropertyId[p.id] = p.user_id; });
+    }
+
+    for (const { tenant, isUpcoming } of candidates) {
+      if (paidTenantIds.has(tenant.id)) continue;
 
       const message = isUpcoming
         ? `Hi ${tenant.name}, friendly reminder that your rent of $${tenant.rent_amount} is due in 3 days.`
         : `Hi ${tenant.name}, your rent of $${tenant.rent_amount} was due a couple days ago. Please arrange payment as soon as you can.`;
 
       try {
-        const { data: property } = await supabase.from('properties').select('user_id').eq('id', tenant.property_id).single();
-        await sendSMS(tenant.phone, message, property ? property.user_id : null);
+        const ownerId = ownerByPropertyId[tenant.property_id] || null;
+        await sendSMS(tenant.phone, message, ownerId);
       } catch (smsError) {
         console.error(`Rent reminder SMS to tenant ${tenant.id} failed:`, smsError.message);
       }
