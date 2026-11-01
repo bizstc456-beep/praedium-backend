@@ -1826,6 +1826,33 @@ app.get('/api/tenant-portal/me', requireTenantAuth, async (req, res) => {
   }
 });
 
+// Tenant portal: update my own language preference (EN/FR toggle)
+app.put('/api/tenant-portal/language', requireTenantAuth, async (req, res) => {
+  try {
+    const { preferred_language } = req.body;
+    if (!['en', 'fr'].includes(preferred_language)) {
+      return res.status(400).json({ error: 'Unsupported language' });
+    }
+
+    const { data: tenant, error } = await supabase
+      .from('tenants')
+      .update({ preferred_language })
+      .eq('id', req.tenant.id)
+      .select('id, preferred_language')
+      .single();
+
+    if (error) {
+      console.error('Tenant language update failed:', error.message);
+      return res.status(500).json({ error: 'Failed to save language preference' });
+    }
+
+    return res.status(200).json(tenant);
+  } catch (err) {
+    console.error('Tenant language update error', err);
+    return res.status(500).json({ error: 'Failed to save language preference' });
+  }
+});
+
 // Tenant portal: my payment history + current balance
 app.get('/api/tenant-portal/payments', requireTenantAuth, async (req, res) => {
   try {
@@ -3568,7 +3595,7 @@ app.get('/api/account', requireAuth, async (req, res) => {
   try {
     const { data: account, error: accountError } = await supabase
       .from('customers')
-      .select('name, email, phone')
+      .select('name, email, phone, preferred_language')
       .eq('user_id', req.user.id)
       .single();
 
@@ -3586,7 +3613,7 @@ app.get('/api/account', requireAuth, async (req, res) => {
 
 app.put('/api/account', requireAuth, async (req, res) => {
   try {
-    const { phone } = req.body;
+    const { phone, preferred_language } = req.body;
 
     if (phone) {
       const digitsOnly = String(phone).replace(/[^\d+]/g, '');
@@ -3595,22 +3622,30 @@ app.put('/api/account', requireAuth, async (req, res) => {
       }
     }
 
+    if (preferred_language !== undefined && preferred_language !== null && !['en', 'fr'].includes(preferred_language)) {
+      return res.status(400).json({ error: 'Unsupported language' });
+    }
+
+    const updates = {};
+    if (phone !== undefined) updates.phone = phone || null;
+    if (preferred_language !== undefined) updates.preferred_language = preferred_language;
+
     const { data: account, error: updateError } = await supabase
       .from('customers')
-      .update({ phone: phone || null })
+      .update(updates)
       .eq('user_id', req.user.id)
-      .select('name, email, phone')
+      .select('name, email, phone, preferred_language')
       .single();
 
     if (updateError) {
-      console.error('Account update: failed to save phone', updateError);
-      return res.status(500).json({ error: 'Failed to save phone number' });
+      console.error('Account update: failed to save changes', updateError);
+      return res.status(500).json({ error: 'Failed to save changes' });
     }
 
     return res.status(200).json(account);
   } catch (err) {
     console.error('Account update error', err);
-    return res.status(500).json({ error: 'Failed to save phone number' });
+    return res.status(500).json({ error: 'Failed to save changes' });
   }
 });
 app.get('/api/account/export', requireAuth, async (req, res) => {
