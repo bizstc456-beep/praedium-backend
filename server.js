@@ -1743,7 +1743,7 @@ const MAINTENANCE_STATUSES = ['open', 'in_progress', 'resolved'];
 // (an HTTP error response for the manual route, a logged no-op for the
 // automatic one).
 async function inviteTenantToPortal(tenant) {
-  const frontendUrl = process.env.FRONTEND_URL || 'https://www.praedium.pro';
+  const frontendUrl = (process.env.FRONTEND_URL || 'https://app.praedium.pro').split(',')[0].trim().replace(/\/$/, '');
 
   const { data: inviteData, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(
     tenant.email,
@@ -2701,7 +2701,7 @@ app.post('/api/create-checkout-session', requireAuth, async (req, res) => {
       return res.status(500).json({ error: `${tier.priceEnvVar} is not configured on the server` });
     }
 
-    const frontendUrl = process.env.FRONTEND_URL || 'https://www.praedium.pro';
+    const frontendUrl = (process.env.FRONTEND_URL || 'https://app.praedium.pro').split(',')[0].trim().replace(/\/$/, '');
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
@@ -2993,7 +2993,7 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
       // they'd find out is by noticing a feature stopped working.
       if (customerRow?.phone) {
         try {
-          const frontendUrl = process.env.FRONTEND_URL || 'https://www.praedium.pro';
+          const frontendUrl = (process.env.FRONTEND_URL || 'https://app.praedium.pro').split(',')[0].trim().replace(/\/$/, '');
           const firstName = (customerRow.name || '').split(' ')[0] || 'there';
           await sendSMS(
             customerRow.phone,
