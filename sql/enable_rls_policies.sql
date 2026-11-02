@@ -3,31 +3,29 @@
 -- ============================================================
 -- Run this in the Supabase Dashboard -> SQL Editor -> New query.
 --
--- STEP 0 -- run this FIRST, by itself, to see where you currently stand:
+-- Status as of the last check: RLS is already ON for every table in the
+-- public schema. Only `customers` and `properties` have any policies
+-- defined (scoped to auth.uid() = user_id, which is correct) -- every
+-- other table has RLS on with zero policies, which denies all access by
+-- default to anon/authenticated. This script is additive: it uses policy
+-- names that don't exist yet, so it won't touch or conflict with the
+-- "Customers can ..." policies already in place. It fills in the gaps.
 --
---   select tablename, rowsecurity
---   from pg_tables
---   where schemaname = 'public'
---   order by tablename;
---
--- rowsecurity = false on any table below means that table currently has
--- ZERO protection against being read directly through Supabase's
--- auto-generated REST API using the anon key -- and that key is public,
--- shipped inside your frontend's JS bundle for anyone to read out of the
--- browser's network tab or the built files. That's a different, more
--- urgent risk than anything in server.js: it has nothing to do with your
--- backend's ownership checks, and no amount of fixing server.js closes
--- it, because it bypasses server.js entirely. If anything comes back
--- false here, this is worth running today.
+-- Casting note: your existing policies compare auth.uid()::text to the
+-- owner column cast to ::text, which suggests those id columns may not
+-- be native `uuid` type. This script matches that casting throughout so
+-- it won't hit a type-mismatch error regardless of the actual column
+-- type.
 --
 -- What this script does NOT change: your backend always connects to
 -- Supabase with the service role key, which bypasses RLS entirely by
 -- design -- so turning this on doesn't change how the app behaves for
 -- anyone using it normally through app.praedium.pro. It only closes the
--- direct-to-Supabase path that exists outside your backend.
+-- direct-to-Supabase path that exists outside your backend, using the
+-- public anon key.
 --
--- Safe to re-run: every policy is dropped and recreated, so running this
--- more than once won't error or duplicate anything.
+-- Safe to re-run: every policy below is dropped and recreated by name,
+-- so running this more than once won't error or duplicate anything.
 
 -- ---------- properties ----------
 alter table public.properties enable row level security;
@@ -37,8 +35,8 @@ create policy "landlords manage their own properties"
   on public.properties
   for all
   to authenticated
-  using (user_id = auth.uid())
-  with check (user_id = auth.uid());
+  using (auth.uid()::text = user_id::text)
+  with check (auth.uid()::text = user_id::text);
 
 -- ---------- tenants ----------
 alter table public.tenants enable row level security;
@@ -51,13 +49,13 @@ create policy "landlords manage tenants on their properties"
   using (
     exists (
       select 1 from public.properties p
-      where p.id = tenants.property_id and p.user_id = auth.uid()
+      where p.id::text = tenants.property_id::text and p.user_id::text = auth.uid()::text
     )
   )
   with check (
     exists (
       select 1 from public.properties p
-      where p.id = tenants.property_id and p.user_id = auth.uid()
+      where p.id::text = tenants.property_id::text and p.user_id::text = auth.uid()::text
     )
   );
 
@@ -66,15 +64,15 @@ create policy "tenants read their own record"
   on public.tenants
   for select
   to authenticated
-  using (auth_user_id = auth.uid());
+  using (auth_user_id::text = auth.uid()::text);
 
 drop policy if exists "tenants update their own language preference" on public.tenants;
 create policy "tenants update their own language preference"
   on public.tenants
   for update
   to authenticated
-  using (auth_user_id = auth.uid())
-  with check (auth_user_id = auth.uid());
+  using (auth_user_id::text = auth.uid()::text)
+  with check (auth_user_id::text = auth.uid()::text);
 
 -- ---------- payments ----------
 alter table public.payments enable row level security;
@@ -87,15 +85,15 @@ create policy "landlords manage payments for their tenants"
   using (
     exists (
       select 1 from public.tenants t
-      join public.properties p on p.id = t.property_id
-      where t.id = payments.tenant_id and p.user_id = auth.uid()
+      join public.properties p on p.id::text = t.property_id::text
+      where t.id::text = payments.tenant_id::text and p.user_id::text = auth.uid()::text
     )
   )
   with check (
     exists (
       select 1 from public.tenants t
-      join public.properties p on p.id = t.property_id
-      where t.id = payments.tenant_id and p.user_id = auth.uid()
+      join public.properties p on p.id::text = t.property_id::text
+      where t.id::text = payments.tenant_id::text and p.user_id::text = auth.uid()::text
     )
   );
 
@@ -107,7 +105,7 @@ create policy "tenants read their own payments"
   using (
     exists (
       select 1 from public.tenants t
-      where t.id = payments.tenant_id and t.auth_user_id = auth.uid()
+      where t.id::text = payments.tenant_id::text and t.auth_user_id::text = auth.uid()::text
     )
   );
 
@@ -119,8 +117,8 @@ create policy "landlords manage their own expenses"
   on public.expenses
   for all
   to authenticated
-  using (user_id = auth.uid())
-  with check (user_id = auth.uid());
+  using (auth.uid()::text = user_id::text)
+  with check (auth.uid()::text = user_id::text);
 
 -- ---------- documents ----------
 alter table public.documents enable row level security;
@@ -130,8 +128,8 @@ create policy "landlords manage their own documents"
   on public.documents
   for all
   to authenticated
-  using (user_id = auth.uid())
-  with check (user_id = auth.uid());
+  using (auth.uid()::text = user_id::text)
+  with check (auth.uid()::text = user_id::text);
 
 -- No tenant policy here on purpose: the tenant portal (v1) doesn't give
 -- tenants a documents view at all -- only lease info, payments, and
@@ -149,13 +147,13 @@ create policy "landlords manage requests on their properties"
   using (
     exists (
       select 1 from public.properties p
-      where p.id = maintenance_requests.property_id and p.user_id = auth.uid()
+      where p.id::text = maintenance_requests.property_id::text and p.user_id::text = auth.uid()::text
     )
   )
   with check (
     exists (
       select 1 from public.properties p
-      where p.id = maintenance_requests.property_id and p.user_id = auth.uid()
+      where p.id::text = maintenance_requests.property_id::text and p.user_id::text = auth.uid()::text
     )
   );
 
@@ -167,13 +165,13 @@ create policy "tenants manage their own requests"
   using (
     exists (
       select 1 from public.tenants t
-      where t.id = maintenance_requests.tenant_id and t.auth_user_id = auth.uid()
+      where t.id::text = maintenance_requests.tenant_id::text and t.auth_user_id::text = auth.uid()::text
     )
   )
   with check (
     exists (
       select 1 from public.tenants t
-      where t.id = maintenance_requests.tenant_id and t.auth_user_id = auth.uid()
+      where t.id::text = maintenance_requests.tenant_id::text and t.auth_user_id::text = auth.uid()::text
     )
   );
 
@@ -185,22 +183,16 @@ create policy "landlords manage their own vendors"
   on public.vendors
   for all
   to authenticated
-  using (user_id = auth.uid())
-  with check (user_id = auth.uid());
+  using (auth.uid()::text = user_id::text)
+  with check (auth.uid()::text = user_id::text);
 
 -- ---------- customers (billing) ----------
+-- Already has "Customers can view/update their own data" policies
+-- (SELECT, UPDATE). No change needed there. We deliberately do NOT add
+-- an insert/delete policy here -- plan tier, subscription status, and
+-- Stripe ids should only ever be written by the backend (service role)
+-- or the Stripe webhook, never directly by a logged-in user.
 alter table public.customers enable row level security;
-
-drop policy if exists "landlords read their own billing record" on public.customers;
-create policy "landlords read their own billing record"
-  on public.customers
-  for select
-  to authenticated
-  using (user_id = auth.uid());
-
--- No insert/update/delete policy here on purpose: plan tier, subscription
--- status, and Stripe ids are only ever written by the backend (service
--- role) or the Stripe webhook, never directly by a logged-in user.
 
 -- ---------- sms_messages ----------
 alter table public.sms_messages enable row level security;
@@ -210,7 +202,7 @@ create policy "landlords read their own sms history"
   on public.sms_messages
   for select
   to authenticated
-  using (user_id = auth.uid());
+  using (auth.uid()::text = user_id::text);
 
 -- ---------- sms_templates ----------
 -- Shared read-only reference data (canned message templates), not
