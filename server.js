@@ -45,9 +45,11 @@ const rateLimit = require('express-rate-limit');
 const { createClient } = require('@supabase/supabase-js');
 const Stripe = require('stripe');
 const twilio = require('twilio');
+const { Resend } = require('resend');
 const Anthropic = require('@anthropic-ai/sdk');
 const multer = require('multer');
 const cron = require('node-cron');
+const crypto = require('crypto');
 
 // ============================================
 // INITIALIZE ALL SERVICES
@@ -209,6 +211,13 @@ const twilioClient = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
 );
+
+// Resend (transactional email). Optional in dev/until configured --
+// RESEND_API_KEY unset just means sendEmail() below logs a warning and
+// no-ops instead of crashing, same spirit as the rest of this file's
+// "missing env var" handling.
+const resendClient = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const MAIL_FROM = process.env.MAIL_FROM || 'Praedium <noreply@praedium.pro>';
 
 // Claude (AI)
 const anthropic = new Anthropic({
@@ -3175,6 +3184,80 @@ async function sendSMS(phone, message, user_id) {
   }
 }
 
+// Best-effort transactional email. Mirrors sendSMS's error handling: logs
+// and re-throws so a caller can catch it without the whole request failing
+// just because an email didn't go out.
+async function sendEmail(to, subject, html) {
+  if (!resendClient) {
+    console.error('sendEmail called but RESEND_API_KEY is not set -- email not sent:', subject);
+    return null;
+  }
+  try {
+    const result = await resendClient.emails.send({
+      from: MAIL_FROM,
+      to,
+      subject,
+      html
+    });
+    return result;
+  } catch (error) {
+    console.error('Email error:', error);
+    throw error;
+  }
+}
+
+// Account-deletion-request email: tells the account holder a deletion was
+// requested and gives them a one-click link to cancel it within the grace
+// period. Bilingual based on the customer's own preferred_language
+// (defaults to English).
+function buildDeletionRequestEmail(language, cancelUrl, graceDays) {
+  if (language === 'fr') {
+    return {
+      subject: 'Suppression de compte demandee - Praedium',
+      html: `
+        <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
+          <h2>Suppression de compte demandee</h2>
+          <p>Une demande de suppression a ete faite pour votre compte Praedium.</p>
+          <p>Si c'est vous qui avez fait cette demande et que vous voulez continuer, aucune action n'est requise -- votre compte sera traite apres la periode de grace de ${graceDays} jours.</p>
+          <p><strong>Si vous n'avez pas fait cette demande, ou si vous avez change d'idee</strong>, vous pouvez l'annuler en cliquant ci-dessous dans les ${graceDays} prochains jours :</p>
+          <p style="text-align: center; margin: 24px 0;">
+            <a href="${cancelUrl}" style="background:#1f2937; color:white; padding:12px 24px; border-radius:8px; text-decoration:none; display:inline-block;">Annuler la suppression</a>
+          </p>
+          <p style="color:#666; font-size: 13px;">Ce lien expire dans ${graceDays} jours. Si vous avez des questions, repondez simplement a ce courriel.</p>
+        </div>
+      `
+    };
+  }
+  return {
+    subject: 'Account deletion requested - Praedium',
+    html: `
+      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
+        <h2>Account deletion requested</h2>
+        <p>A deletion request was made for your Praedium account.</p>
+        <p>If this was you and you'd like to proceed, no action is needed -- your account will be processed after the ${graceDays}-day grace period.</p>
+        <p><strong>If you didn't request this, or changed your mind</strong>, you can cancel it below within the next ${graceDays} days:</p>
+        <p style="text-align: center; margin: 24px 0;">
+          <a href="${cancelUrl}" style="background:#1f2937; color:white; padding:12px 24px; border-radius:8px; text-decoration:none; display:inline-block;">Cancel deletion</a>
+        </p>
+        <p style="color:#666; font-size: 13px;">This link expires in ${graceDays} days. If you have questions, just reply to this email.</p>
+      </div>
+    `
+  };
+}
+
+function buildDeletionCancelledEmail(language) {
+  if (language === 'fr') {
+    return {
+      subject: 'Suppression de compte annulee - Praedium',
+      html: `<div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;"><h2>Suppression annulee</h2><p>Votre demande de suppression de compte a bien ete annulee. Votre compte et vos donnees restent actifs, sans aucun changement.</p></div>`
+    };
+  }
+  return {
+    subject: 'Account deletion cancelled - Praedium',
+    html: `<div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;"><h2>Deletion cancelled</h2><p>Your account deletion request has been cancelled. Your account and data remain active, with no changes made.</p></div>`
+  };
+}
+
 function generateReceipt(tenantName, amount, paymentDate, paymentMethod) {
   return {
     tenant_name: tenantName,
@@ -3602,6 +3685,8 @@ app.get('/api/health', (req, res) => {
 // account and notify the founder so it can be reviewed/actioned
 // manually, rather than hard-deleting on the spot.
 
+const DELETION_GRACE_PERIOD_DAYS = 7;
+
 app.get('/api/account', requireAuth, async (req, res) => {
   try {
     const { data: account, error: accountError } = await supabase
@@ -3746,7 +3831,7 @@ app.post('/api/account/delete-request', requireAuth, async (req, res) => {
   try {
     const { data: existing, error: fetchError } = await supabase
       .from('customers')
-      .select('user_id, email, name, deletion_requested_at')
+      .select('user_id, email, name, preferred_language, deletion_requested_at')
       .eq('user_id', req.user.id)
       .single();
 
@@ -3764,9 +3849,14 @@ app.post('/api/account/delete-request', requireAuth, async (req, res) => {
     }
 
     const requestedAt = new Date().toISOString();
+    const cancelToken = crypto.randomBytes(32).toString('hex');
     const { error: updateError } = await supabase
       .from('customers')
-      .update({ deletion_requested_at: requestedAt })
+      .update({
+        deletion_requested_at: requestedAt,
+        deletion_cancel_token: cancelToken,
+        deletion_grace_alert_sent: false
+      })
       .eq('user_id', req.user.id);
 
     if (updateError) {
@@ -3787,6 +3877,17 @@ app.post('/api/account/delete-request', requireAuth, async (req, res) => {
       }
     }
 
+    if (existing.email) {
+      try {
+        const frontendUrl = (process.env.FRONTEND_URL || 'https://app.praedium.pro').split(',')[0].trim().replace(/\/$/, '');
+        const cancelUrl = `${frontendUrl}/cancel-deletion?token=${cancelToken}`;
+        const { subject, html } = buildDeletionRequestEmail(existing.preferred_language, cancelUrl, DELETION_GRACE_PERIOD_DAYS);
+        await sendEmail(existing.email, subject, html);
+      } catch (emailErr) {
+        console.error('Failed to send deletion-request email', emailErr);
+      }
+    }
+
     return res.status(200).json({
       success: true,
       already_requested: false,
@@ -3797,6 +3898,124 @@ app.post('/api/account/delete-request', requireAuth, async (req, res) => {
     return res.status(500).json({ error: 'Failed to submit deletion request' });
   }
 });
+
+// Public (token-based, no session needed) -- this is hit from the link in
+// the deletion-request email, which the account holder may click from a
+// device they aren't logged in on. The random 32-byte token in
+// deletion_cancel_token is the only thing authorizing this, so it's
+// cleared (and the column no longer matches anything) as soon as it's
+// used once, or once the grace period has passed.
+app.post('/api/account/cancel-deletion', async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ error: 'invalid_token' });
+    }
+
+    const { data: existing, error: fetchError } = await supabase
+      .from('customers')
+      .select('user_id, email, name, preferred_language, deletion_requested_at, deletion_cancel_token')
+      .eq('deletion_cancel_token', token)
+      .single();
+
+    if (fetchError || !existing || !existing.deletion_requested_at) {
+      return res.status(404).json({ error: 'not_found' });
+    }
+
+    const requestedAtMs = new Date(existing.deletion_requested_at).getTime();
+    const expiresAtMs = requestedAtMs + DELETION_GRACE_PERIOD_DAYS * 24 * 60 * 60 * 1000;
+    if (Date.now() > expiresAtMs) {
+      return res.status(410).json({ error: 'expired' });
+    }
+
+    const { error: updateError } = await supabase
+      .from('customers')
+      .update({
+        deletion_requested_at: null,
+        deletion_cancel_token: null,
+        deletion_grace_alert_sent: false
+      })
+      .eq('user_id', existing.user_id);
+
+    if (updateError) {
+      console.error('Cancel deletion: failed to update customer row', updateError);
+      return res.status(500).json({ error: 'Failed to cancel deletion request' });
+    }
+
+    if (process.env.OWNER_PHONE_NUMBER) {
+      try {
+        const who = existing.email || existing.name || existing.user_id;
+        await sendSMS(
+          process.env.OWNER_PHONE_NUMBER,
+          `Praedium: deletion request by ${who} was cancelled by the account holder.`,
+          existing.user_id
+        );
+      } catch (smsErr) {
+        console.error('Failed to send deletion-cancelled SMS alert', smsErr);
+      }
+    }
+
+    if (existing.email) {
+      try {
+        const { subject, html } = buildDeletionCancelledEmail(existing.preferred_language);
+        await sendEmail(existing.email, subject, html);
+      } catch (emailErr) {
+        console.error('Failed to send deletion-cancelled email', emailErr);
+      }
+    }
+
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error('Cancel deletion error', err);
+    return res.status(500).json({ error: 'Failed to cancel deletion request' });
+  }
+});
+
+// Runs once a day. Deletion requests are never auto-processed -- the
+// actual delete step stays a manual, deliberate action -- but once the
+// grace period has passed with no cancellation, re-alert the owner so a
+// stale request doesn't just sit there unnoticed.
+// deletion_grace_alert_sent keeps this from re-alerting every day for the
+// same request.
+async function checkStaleDeletionRequests() {
+  try {
+    const cutoff = new Date(Date.now() - DELETION_GRACE_PERIOD_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const { data: staleRequests, error } = await supabase
+      .from('customers')
+      .select('user_id, email, name, deletion_requested_at')
+      .not('deletion_requested_at', 'is', null)
+      .lte('deletion_requested_at', cutoff)
+      .eq('deletion_grace_alert_sent', false);
+
+    if (error) {
+      console.error('checkStaleDeletionRequests: failed to query customers', error.message);
+      return;
+    }
+
+    for (const customer of staleRequests || []) {
+      const who = customer.email || customer.name || customer.user_id;
+      if (process.env.OWNER_PHONE_NUMBER) {
+        try {
+          await sendSMS(
+            process.env.OWNER_PHONE_NUMBER,
+            `Praedium: grace period passed, uncancelled, for ${who}'s deletion request. Ready to process manually.`,
+            customer.user_id
+          );
+        } catch (smsErr) {
+          console.error(`Stale deletion alert SMS failed for ${customer.user_id}:`, smsErr.message);
+        }
+      }
+      await supabase
+        .from('customers')
+        .update({ deletion_grace_alert_sent: true })
+        .eq('user_id', customer.user_id);
+    }
+  } catch (err) {
+    console.error('checkStaleDeletionRequests failed:', err.message);
+  }
+}
+
+cron.schedule('0 10 * * *', checkStaleDeletionRequests);
 
 // Upload errors (e.g. a file over the multer size limit) are thrown by
 // the upload.single(...) middleware before a route's own try/catch runs,

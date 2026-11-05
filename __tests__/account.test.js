@@ -221,7 +221,11 @@ describe('POST /api/account/delete-request', () => {
     expect(res.body.deletion_requested_at).toEqual(expect.any(String));
 
     const builder = supabaseMock.from.mock.results[0].value;
-    expect(builder.update).toHaveBeenCalledWith({ deletion_requested_at: res.body.deletion_requested_at });
+    expect(builder.update).toHaveBeenCalledWith({
+      deletion_requested_at: res.body.deletion_requested_at,
+      deletion_cancel_token: expect.any(String),
+      deletion_grace_alert_sent: false,
+    });
     expect(builder.eq).toHaveBeenCalledWith('user_id', 'user_123');
 
     expect(twilioMock.messages.create).toHaveBeenCalledTimes(1);
@@ -279,5 +283,80 @@ describe('POST /api/account/delete-request', () => {
     expect(twilioMock.messages.create).not.toHaveBeenCalled();
 
     process.env.OWNER_PHONE_NUMBER = originalNumber;
+  });
+});
+
+describe('POST /api/account/cancel-deletion', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('rejects a request with no token', async () => {
+    const res = await request(app).post('/api/account/cancel-deletion').send({});
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_token');
+  });
+
+  test('returns 404 for a token that matches no pending request', async () => {
+    supabaseMock.from.mockReturnValue(makeQueryResult({ data: null, error: { message: 'no rows' } }));
+
+    const res = await request(app).post('/api/account/cancel-deletion').send({ token: 'nope' });
+
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('not_found');
+  });
+
+  test('returns 410 once the 7-day grace period has passed', async () => {
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    supabaseMock.from.mockReturnValue(
+      makeQueryResult({
+        data: {
+          user_id: 'user_123',
+          email: 'landlord@example.com',
+          name: 'Felix',
+          deletion_requested_at: tenDaysAgo,
+          deletion_cancel_token: 'sometoken',
+        },
+        error: null,
+      })
+    );
+
+    const res = await request(app).post('/api/account/cancel-deletion').send({ token: 'sometoken' });
+
+    expect(res.status).toBe(410);
+    expect(res.body.error).toBe('expired');
+  });
+
+  test('clears the deletion request and texts the owner for a valid, unexpired token', async () => {
+    const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString();
+    supabaseMock.from.mockReturnValue(
+      makeQueryResult({
+        data: {
+          user_id: 'user_123',
+          email: 'landlord@example.com',
+          name: 'Felix',
+          deletion_requested_at: twoDaysAgo,
+          deletion_cancel_token: 'validtoken',
+        },
+        error: null,
+      })
+    );
+    twilioMock.messages.create.mockResolvedValue({ sid: 'SM789', status: 'queued' });
+
+    const res = await request(app).post('/api/account/cancel-deletion').send({ token: 'validtoken' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ success: true });
+
+    const builder = supabaseMock.from.mock.results[0].value;
+    expect(builder.update).toHaveBeenCalledWith({
+      deletion_requested_at: null,
+      deletion_cancel_token: null,
+      deletion_grace_alert_sent: false,
+    });
+
+    expect(twilioMock.messages.create).toHaveBeenCalledTimes(1);
+    const smsArgs = twilioMock.messages.create.mock.calls[0][0];
+    expect(smsArgs.body).toMatch(/cancelled/i);
   });
 });
