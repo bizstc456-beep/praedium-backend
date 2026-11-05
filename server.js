@@ -637,7 +637,10 @@ function toNullableDate(value) {
 // Add a tenant (a unit + its lease) to a property you own
 app.post('/api/tenants', requireAuth, async (req, res) => {
   try {
-    const { property_id, name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date } = req.body;
+    const {
+      property_id, name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date,
+      lowest_rent_disclosed_amount, lowest_rent_disclosure_note,
+    } = req.body;
 
     if (!property_id || !name || !phone) {
       return res.status(400).json({ error: 'property_id, name, and phone are required' });
@@ -669,6 +672,8 @@ app.post('/api/tenants', requireAuth, async (req, res) => {
           rent_amount,
           lease_start_date: toNullableDate(lease_start_date),
           lease_end_date: toNullableDate(lease_end_date),
+          lowest_rent_disclosed_amount: lowest_rent_disclosed_amount || null,
+          lowest_rent_disclosure_note: lowest_rent_disclosure_note || null,
           created_at: new Date()
         }
       ])
@@ -736,7 +741,10 @@ app.put('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
       return res.status(403).json({ error: 'You do not manage this tenant' });
     }
 
-    const { name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date } = req.body;
+    const {
+      name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date,
+      lowest_rent_disclosed_amount, lowest_rent_disclosure_note,
+    } = req.body;
     const updates = {
       name,
       email,
@@ -745,6 +753,8 @@ app.put('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
       rent_amount,
       lease_start_date: toNullableDate(lease_start_date),
       lease_end_date: toNullableDate(lease_end_date),
+      lowest_rent_disclosed_amount: lowest_rent_disclosed_amount || null,
+      lowest_rent_disclosure_note: lowest_rent_disclosure_note || null,
     };
 
     const { data, error } = await supabase
