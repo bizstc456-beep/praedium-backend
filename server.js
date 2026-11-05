@@ -640,6 +640,7 @@ app.post('/api/tenants', requireAuth, async (req, res) => {
     const {
       property_id, name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date,
       lowest_rent_disclosed_amount, lowest_rent_disclosure_note,
+      is_month_to_month, planned_rent_change_date,
     } = req.body;
 
     if (!property_id || !name || !phone) {
@@ -674,6 +675,8 @@ app.post('/api/tenants', requireAuth, async (req, res) => {
           lease_end_date: toNullableDate(lease_end_date),
           lowest_rent_disclosed_amount: lowest_rent_disclosed_amount || null,
           lowest_rent_disclosure_note: lowest_rent_disclosure_note || null,
+          is_month_to_month: !!is_month_to_month,
+          planned_rent_change_date: toNullableDate(planned_rent_change_date),
           created_at: new Date()
         }
       ])
@@ -744,6 +747,7 @@ app.put('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
     const {
       name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date,
       lowest_rent_disclosed_amount, lowest_rent_disclosure_note,
+      is_month_to_month, planned_rent_change_date,
     } = req.body;
     const updates = {
       name,
@@ -755,6 +759,8 @@ app.put('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
       lease_end_date: toNullableDate(lease_end_date),
       lowest_rent_disclosed_amount: lowest_rent_disclosed_amount || null,
       lowest_rent_disclosure_note: lowest_rent_disclosure_note || null,
+      is_month_to_month: !!is_month_to_month,
+      planned_rent_change_date: toNullableDate(planned_rent_change_date),
     };
 
     const { data, error } = await supabase
@@ -2249,6 +2255,47 @@ function monthsBetween(start, end) {
 }
 
 function computeRenewalWindow(tenant) {
+  const MS_PER_DAY = 24 * 60 * 60 * 1000;
+  const today = new Date();
+
+  // Month-to-month (indeterminate-term) lease: there's no lease end date to
+  // count back from. Quebec's notice rule for these is different -- it's
+  // 1-2 months before whichever effective date the landlord picks for a
+  // rent increase or other change, not tied to any lease end. With no
+  // planned date yet, there's no window to compute at all -- just flag that
+  // one hasn't been set.
+  if (tenant.is_month_to_month) {
+    if (!tenant.planned_rent_change_date) {
+      return {
+        bracket: '1-2 months before your planned change date',
+        window_start: null,
+        window_end: null,
+        status: 'month_to_month_no_date',
+        days_until_window_opens: null,
+        days_until_window_closes: null,
+      };
+    }
+
+    const changeDate = new Date(tenant.planned_rent_change_date);
+    const windowStart = addMonths(changeDate, -2);
+    const windowEnd = addMonths(changeDate, -1);
+
+    let mtmStatus;
+    if (today < windowStart) mtmStatus = 'upcoming';
+    else if (today <= windowEnd) mtmStatus = 'in_window';
+    else if (today <= changeDate) mtmStatus = 'window_passed';
+    else mtmStatus = 'month_to_month_date_passed';
+
+    return {
+      bracket: '1-2 months before your planned change date',
+      window_start: windowStart.toISOString().slice(0, 10),
+      window_end: windowEnd.toISOString().slice(0, 10),
+      status: mtmStatus,
+      days_until_window_opens: Math.ceil((windowStart - today) / MS_PER_DAY),
+      days_until_window_closes: Math.ceil((windowEnd - today) / MS_PER_DAY),
+    };
+  }
+
   if (!tenant.lease_end_date) return null;
 
   const end = new Date(tenant.lease_end_date);
@@ -2262,14 +2309,11 @@ function computeRenewalWindow(tenant) {
   const windowStart = isStandardTerm ? addMonths(end, -6) : addMonths(end, -2);
   const windowEnd = isStandardTerm ? addMonths(end, -3) : addMonths(end, -1);
 
-  const today = new Date();
   let status;
   if (today < windowStart) status = 'upcoming';
   else if (today <= windowEnd) status = 'in_window';
   else if (today <= end) status = 'window_passed';
   else status = 'lease_ended';
-
-  const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
   return {
     bracket: isStandardTerm ? '3-6 months before lease end' : '1-2 months before lease end',
@@ -2304,11 +2348,15 @@ app.get('/api/lease-renewals/landlord/:user_id', requireAuth, async (req, res) =
       return res.json({ success: true, renewals: [] });
     }
 
+    // Include every tenant with a fixed lease end date, plus every
+    // month-to-month tenant -- computeRenewalWindow() returns null (and
+    // gets filtered out below) for anyone who is neither, so this doesn't
+    // need to be more precise than "could plausibly have a window".
     const { data: tenants, error: tenantsError } = await supabase
       .from('tenants')
       .select('*')
       .in('property_id', propertyIds)
-      .not('lease_end_date', 'is', null);
+      .or('lease_end_date.not.is.null,is_month_to_month.eq.true');
     if (tenantsError) return res.status(400).json({ error: tenantsError.message });
 
     const renewals = (tenants || [])
@@ -2323,12 +2371,22 @@ app.get('/api/lease-renewals/landlord/:user_id', requireAuth, async (req, res) =
           property_address: propertyById[t.property_id]?.address || null,
           lease_start_date: t.lease_start_date,
           lease_end_date: t.lease_end_date,
+          is_month_to_month: !!t.is_month_to_month,
+          planned_rent_change_date: t.planned_rent_change_date,
           renewal_notice_sent_at: t.renewal_notice_sent_at,
           ...window,
         };
       })
       .filter(Boolean)
-      .sort((a, b) => new Date(a.window_start) - new Date(b.window_start));
+      .sort((a, b) => {
+        // Month-to-month tenants with no planned date yet have no window
+        // to sort by -- push them to the end instead of letting Invalid
+        // Date comparisons scatter them unpredictably.
+        if (!a.window_start && !b.window_start) return 0;
+        if (!a.window_start) return 1;
+        if (!b.window_start) return -1;
+        return new Date(a.window_start) - new Date(b.window_start);
+      });
 
     res.json({ success: true, renewals });
   } catch (error) {
@@ -2487,12 +2545,17 @@ app.get('/api/tenants/landlord/:user_id', requireAuth, async (req, res) => {
       const daysUntilLeaseEnd = t.lease_end_date
         ? Math.ceil((new Date(t.lease_end_date) - today) / MS_PER_DAY)
         : null;
+      // Use the same TAL notice-window math as the Lease Renewals page
+      // instead of a flat "within 90 days" guess -- that flat heuristic
+      // flags shorter leases weeks before their real (1-2 month) window
+      // actually opens, and completely misses month-to-month tenants.
+      const renewalWindow = computeRenewalWindow(t);
       return {
         ...t,
         collected_this_month: collected,
         pending_amount: pending,
         status: pending > 0 ? 'pending' : 'paid',
-        renewal_soon: daysUntilLeaseEnd !== null && daysUntilLeaseEnd >= 0 && daysUntilLeaseEnd <= 90,
+        renewal_soon: !!renewalWindow && (renewalWindow.status === 'in_window' || renewalWindow.status === 'window_passed'),
         days_until_lease_end: daysUntilLeaseEnd,
       };
     });
@@ -3454,15 +3517,19 @@ app.get('/api/dashboard/:user_id', requireAuth, async (req, res) => {
       const daysUntilLeaseEnd = t.lease_end_date
         ? Math.ceil((new Date(t.lease_end_date) - today) / MS_PER_DAY)
         : null;
+      // Use the same TAL notice-window math as the Lease Renewals page
+      // (3-6 months out for a standard-term lease, 1-2 months for a
+      // shorter fixed term or a month-to-month tenant's planned change
+      // date) instead of a flat "within 90 days" guess, which flags
+      // shorter leases too early and misses month-to-month tenants
+      // entirely.
+      const renewalWindow = computeRenewalWindow(t);
       return {
         ...t,
         collected_this_month: collected,
         pending_amount: pending,
         status: pending > 0 ? 'pending' : 'paid',
-        // Quebec's lease non-renewal / rent-increase notice window opens
-        // 3-6 months before the lease ends -- flag inside 90 days so it's
-        // never missed by accident.
-        renewal_soon: daysUntilLeaseEnd !== null && daysUntilLeaseEnd >= 0 && daysUntilLeaseEnd <= 90,
+        renewal_soon: !!renewalWindow && (renewalWindow.status === 'in_window' || renewalWindow.status === 'window_passed'),
         days_until_lease_end: daysUntilLeaseEnd,
       };
     });
