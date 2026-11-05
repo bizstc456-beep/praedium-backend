@@ -2997,7 +2997,7 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
           const firstName = (customerRow.name || '').split(' ')[0] || 'there';
           await sendSMS(
             customerRow.phone,
-            `Hi ${firstName}, your Praedium payment of $${amount} didn't go through. Please update your payment method at ${frontendUrl}/payment to keep your account active.`,
+            withSmsFooter(`Hi ${firstName}, your Praedium payment of $${amount} didn't go through. Please update your payment method at ${frontendUrl}/payment to keep your account active.`),
             customerRow.user_id || null
           );
         } catch (smsErr) {
@@ -3056,6 +3056,17 @@ function extractClaudeText(response) {
   return textBlock.text;
 }
 
+// CASL requires every commercial electronic message to identify the sender
+// and offer a way to opt out. Twilio auto-blocks future delivery to anyone
+// who replies STOP/CANCEL/UNSUBSCRIBE (Advanced Opt-Out), but that only
+// protects people who were actually told it's available -- so every
+// outbound, tenant/landlord-facing SMS gets this appended.
+const SMS_FOOTER = ' - Praedium. Reply STOP to opt out.';
+function withSmsFooter(message) {
+  if (!message) return message;
+  return message.includes('STOP') ? message : `${message}${SMS_FOOTER}`;
+}
+
 async function generateWelcomeMessage(tenantName, propertyAddress, unitLabel) {
   const message = await anthropic.messages.create({
     model: 'claude-opus-5',
@@ -3075,7 +3086,7 @@ async function generateWelcomeMessage(tenantName, propertyAddress, unitLabel) {
     ]
   });
 
-  return extractClaudeText(message);
+  return withSmsFooter(extractClaudeText(message));
 }
 
 async function generateLandlordWelcomeMessage(landlordName) {
@@ -3091,7 +3102,7 @@ async function generateLandlordWelcomeMessage(landlordName) {
     ]
   });
 
-  return extractClaudeText(message);
+  return withSmsFooter(extractClaudeText(message));
 }
 
 async function generatePaymentConfirmationMessage(tenantName, amount) {
@@ -3113,7 +3124,7 @@ async function generatePaymentConfirmationMessage(tenantName, amount) {
     ]
   });
 
-  return extractClaudeText(message);
+  return withSmsFooter(extractClaudeText(message));
 }
 
 // Twilio requires E.164 format (+1XXXXXXXXXX) for the "to" number. The
@@ -3264,9 +3275,9 @@ async function sendDueRentReminders() {
     for (const { tenant, isUpcoming } of candidates) {
       if (paidTenantIds.has(tenant.id)) continue;
 
-      const message = isUpcoming
+      const message = withSmsFooter(isUpcoming
         ? `Hi ${tenant.name}, friendly reminder that your rent of $${tenant.rent_amount} is due in 3 days.`
-        : `Hi ${tenant.name}, your rent of $${tenant.rent_amount} was due a couple days ago. Please arrange payment as soon as you can.`;
+        : `Hi ${tenant.name}, your rent of $${tenant.rent_amount} was due a couple days ago. Please arrange payment as soon as you can.`);
 
       try {
         const ownerId = ownerByPropertyId[tenant.property_id] || null;
