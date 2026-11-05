@@ -110,6 +110,11 @@ describe('POST /api/create-checkout-session', () => {
         customer_email: 'landlord@example.com',
         line_items: [expect.objectContaining({ price: 'price_test_starter', quantity: 1 })],
         metadata: expect.objectContaining({ user_id: 'user_123', plan_tier: 'starter' }),
+        // Quebec GST/QST collection via Stripe Tax -- automatic_tax can't
+        // calculate anything without a billing address, which is why both
+        // of these go together.
+        automatic_tax: { enabled: true },
+        billing_address_collection: 'required',
       })
     );
   });

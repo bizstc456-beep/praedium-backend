@@ -2853,6 +2853,17 @@ app.post('/api/create-checkout-session', requireAuth, async (req, res) => {
         metadata: { user_id: userId, plan_tier: tierKey },
       },
       metadata: { user_id: userId, plan_tier: tierKey },
+      // Stripe Tax calculates and collects Quebec GST/QST (and any other
+      // jurisdiction's tax) automatically based on the customer's billing
+      // address -- which is why the address has to actually be collected
+      // here (automatic_tax can't calculate anything without one). Prices
+      // in STRIPE_PRICE_* must be configured as tax-exclusive in Stripe for
+      // this to add tax on top rather than carve it out of the sticker
+      // price, and Stripe Tax has to be turned on and registered for
+      // Quebec/Canada in the Stripe dashboard -- this only enables it at
+      // the API call level.
+      automatic_tax: { enabled: true },
+      billing_address_collection: 'required',
       success_url: `${frontendUrl}/payment?checkout=success`,
       cancel_url: `${frontendUrl}/payment?checkout=cancelled`,
     });
@@ -3074,6 +3085,23 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
 
       if (userId && session.mode === 'subscription') {
         const planTier = (session.metadata && session.metadata.plan_tier) || DEFAULT_PLAN_TIER;
+
+        // The checkout session itself doesn't carry the trial end date --
+        // fetch the subscription Stripe just created to get it, so the
+        // trial-ending-reminder cron below knows when to fire without
+        // needing its own webhook subscription (checkout.session.completed,
+        // invoice.payment_succeeded/failed, and customer.subscription.
+        // updated/deleted are the only events this app asks Stripe for).
+        let stripeTrialEnd = null;
+        try {
+          const subscription = await stripe.subscriptions.retrieve(session.subscription);
+          stripeTrialEnd = subscription.trial_end
+            ? new Date(subscription.trial_end * 1000).toISOString()
+            : null;
+        } catch (subErr) {
+          console.error('checkout.session.completed: failed to fetch subscription for trial_end', subErr.message);
+        }
+
         await supabase
           .from('customers')
           .update({
@@ -3081,6 +3109,8 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
             stripe_subscription_id: session.subscription,
             subscription_status: 'trialing',
             plan_tier: planTier,
+            stripe_trial_end: stripeTrialEnd,
+            trial_ending_reminder_sent: false,
           })
           .eq('user_id', userId);
       } else {
@@ -3148,6 +3178,13 @@ app.post('/api/webhooks/stripe', express.raw({ type: 'application/json' }), asyn
         cancel_at_period_end: Boolean(subscription.cancel_at_period_end),
         current_period_end: subscription.current_period_end
           ? new Date(subscription.current_period_end * 1000).toISOString()
+          : null,
+        // Keep the trial-ending-reminder cron's view of the trial end date
+        // current too -- Stripe can shift it (e.g. a manual trial
+        // extension in the dashboard), and it's cleared once the
+        // subscription leaves trialing so a stale date never lingers.
+        stripe_trial_end: subscription.trial_end
+          ? new Date(subscription.trial_end * 1000).toISOString()
           : null,
       };
 
@@ -3381,6 +3418,43 @@ function buildDeletionCancelledEmail(language) {
   return {
     subject: 'Account deletion cancelled - Praedium',
     html: `<div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;"><h2>Deletion cancelled</h2><p>Your account deletion request has been cancelled. Your account and data remain active, with no changes made.</p></div>`
+  };
+}
+
+// Trial-ending-reminder email: tells the account holder their 30-day
+// Stripe trial is about to end and their card will be charged
+// automatically, with enough notice to cancel first if they don't want
+// that. Bilingual based on the customer's own preferred_language, same
+// pattern as the account-deletion emails above.
+function buildTrialEndingEmail(language, daysLeft, planLabel, monthlyPrice) {
+  const priceDisplay = monthlyPrice ? `$${monthlyPrice.toFixed(2)}` : null;
+  if (language === 'fr') {
+    const priceLine = priceDisplay ? ` de ${priceDisplay}` : '';
+    return {
+      subject: `Votre essai Praedium se termine dans ${daysLeft} jour${daysLeft > 1 ? 's' : ''}`,
+      html: `
+        <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
+          <h2>Votre essai gratuit se termine bientot</h2>
+          <p>Votre essai de 30 jours du forfait <strong>${planLabel}</strong> se termine dans ${daysLeft} jour${daysLeft > 1 ? 's' : ''}.</p>
+          <p>Aucune action n'est requise pour continuer -- votre carte sera automatiquement facturee${priceLine}/mois a la fin de l'essai.</p>
+          <p>Si vous souhaitez annuler avant la facturation, vous pouvez le faire a tout moment depuis la page Facturation de votre compte.</p>
+          <p style="color:#666; font-size: 13px;">Si vous avez des questions, repondez simplement a ce courriel.</p>
+        </div>
+      `
+    };
+  }
+  const priceLine = priceDisplay ? ` ${priceDisplay}/month` : '';
+  return {
+    subject: `Your Praedium trial ends in ${daysLeft} day${daysLeft > 1 ? 's' : ''}`,
+    html: `
+      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
+        <h2>Your free trial is ending soon</h2>
+        <p>Your 30-day trial of the <strong>${planLabel}</strong> plan ends in ${daysLeft} day${daysLeft > 1 ? 's' : ''}.</p>
+        <p>No action is needed to continue -- your card will be automatically charged${priceLine} once the trial ends.</p>
+        <p>If you'd like to cancel before being charged, you can do that anytime from your account's Billing page.</p>
+        <p style="color:#666; font-size: 13px;">If you have questions, just reply to this email.</p>
+      </div>
+    `
   };
 }
 
@@ -4146,6 +4220,84 @@ async function checkStaleDeletionRequests() {
 }
 
 cron.schedule('0 10 * * *', checkStaleDeletionRequests);
+
+// How many days before a Stripe trial ends to send the one-time reminder
+// below. Picked to give someone enough notice to decide/cancel without it
+// arriving so early it's forgotten by the time they're actually charged.
+const TRIAL_ENDING_REMINDER_DAYS_BEFORE = 3;
+
+// Daily sweep: find every landlord whose Stripe trial ends within the next
+// TRIAL_ENDING_REMINDER_DAYS_BEFORE days and hasn't been told yet, and send
+// a one-time SMS + email reminder that their card is about to be charged
+// automatically. stripe_trial_end is populated by the checkout.session.
+// completed and customer.subscription.updated webhook handlers above.
+async function sendTrialEndingReminders() {
+  try {
+    const now = new Date();
+    const cutoff = new Date(now.getTime() + TRIAL_ENDING_REMINDER_DAYS_BEFORE * 24 * 60 * 60 * 1000);
+
+    const { data: endingSoon, error } = await supabase
+      .from('customers')
+      .select('user_id, email, name, phone, plan_tier, preferred_language, stripe_trial_end')
+      .eq('subscription_status', 'trialing')
+      .eq('trial_ending_reminder_sent', false)
+      .not('stripe_trial_end', 'is', null)
+      .lte('stripe_trial_end', cutoff.toISOString())
+      .gte('stripe_trial_end', now.toISOString());
+
+    if (error) {
+      console.error('sendTrialEndingReminders: failed to query customers', error.message);
+      return;
+    }
+
+    if (!endingSoon || endingSoon.length === 0) return;
+
+    const prices = await getTierMonthlyPrices();
+
+    for (const customer of endingSoon) {
+      const daysLeft = Math.max(
+        1,
+        Math.ceil((new Date(customer.stripe_trial_end) - now) / (24 * 60 * 60 * 1000))
+      );
+      const tierKey = resolveTierKey(customer.plan_tier);
+      const planLabel = PLAN_TIERS[tierKey].label;
+      const monthlyPrice = prices[tierKey];
+      const language = customer.preferred_language === 'fr' ? 'fr' : 'en';
+
+      if (customer.phone) {
+        try {
+          const firstName = (customer.name || '').split(' ')[0] || 'there';
+          const priceText = monthlyPrice ? ` ($${monthlyPrice.toFixed(2)}/mo)` : '';
+          await sendSMS(
+            customer.phone,
+            withSmsFooter(`Hi ${firstName}, your Praedium ${planLabel} trial ends in ${daysLeft} day${daysLeft > 1 ? 's' : ''}${priceText}. Your card will be charged automatically unless you cancel first.`),
+            customer.user_id
+          );
+        } catch (smsErr) {
+          console.error(`Trial-ending SMS failed for ${customer.user_id}:`, smsErr.message);
+        }
+      }
+
+      if (customer.email) {
+        try {
+          const { subject, html } = buildTrialEndingEmail(language, daysLeft, planLabel, monthlyPrice);
+          await sendEmail(customer.email, subject, html);
+        } catch (emailErr) {
+          console.error(`Trial-ending email failed for ${customer.user_id}:`, emailErr.message);
+        }
+      }
+
+      await supabase
+        .from('customers')
+        .update({ trial_ending_reminder_sent: true })
+        .eq('user_id', customer.user_id);
+    }
+  } catch (err) {
+    console.error('sendTrialEndingReminders failed:', err.message);
+  }
+}
+
+cron.schedule('0 11 * * *', sendTrialEndingReminders);
 
 // Upload errors (e.g. a file over the multer size limit) are thrown by
 // the upload.single(...) middleware before a route's own try/catch runs,
