@@ -217,7 +217,7 @@ const twilioClient = twilio(
 // no-ops instead of crashing, same spirit as the rest of this file's
 // "missing env var" handling.
 const resendClient = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
-const MAIL_FROM = process.env.MAIL_FROM || 'Praedium <noreply@praedium.pro>';
+const MAIL_FROM = process.env.MAIL_FROM || 'Praedium <noreply@mail.praedium.pro>';
 
 // Claude (AI)
 const anthropic = new Anthropic({
