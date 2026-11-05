@@ -3672,21 +3672,64 @@ app.get('/api/account/export', requireAuth, async (req, res) => {
       return res.status(500).json({ error: 'Failed to generate export' });
     }
 
-    const { data: smsHistory, error: smsError } = await supabase
-      .from('sms_messages')
+    // Full data export (Privacy Policy / ToS right to access and portability):
+    // everything a landlord has put into Praedium, not just the billing row.
+    // properties and most tables key off user_id directly; tenants key off
+    // property_id, and payments/maintenance requests key off tenant_id, so
+    // those two need the owned property/tenant ids resolved first.
+    const { data: properties, error: propertiesError } = await supabase
+      .from('properties')
       .select('*')
-      .eq('user_id', req.user.id)
-      .order('created_at', { ascending: false });
-
-    if (smsError) {
-      console.error('Account export: failed to load sms_messages', smsError);
+      .eq('user_id', req.user.id);
+    if (propertiesError) {
+      console.error('Account export: failed to load properties', propertiesError);
       return res.status(500).json({ error: 'Failed to generate export' });
+    }
+    const propertyIds = (properties || []).map((p) => p.id);
+
+    const { data: tenants, error: tenantsError } = propertyIds.length
+      ? await supabase.from('tenants').select('*').in('property_id', propertyIds)
+      : { data: [], error: null };
+    if (tenantsError) {
+      console.error('Account export: failed to load tenants', tenantsError);
+      return res.status(500).json({ error: 'Failed to generate export' });
+    }
+    const tenantIds = (tenants || []).map((t) => t.id);
+
+    const [paymentsRes, documentsRes, expensesRes, maintenanceRes, vendorsRes, smsRes] = await Promise.all([
+      tenantIds.length
+        ? supabase.from('payments').select('*').in('tenant_id', tenantIds)
+        : Promise.resolve({ data: [], error: null }),
+      supabase.from('documents').select('*').eq('user_id', req.user.id),
+      supabase.from('expenses').select('*').eq('user_id', req.user.id),
+      tenantIds.length
+        ? supabase.from('maintenance_requests').select('*').in('tenant_id', tenantIds)
+        : Promise.resolve({ data: [], error: null }),
+      supabase.from('vendors').select('*').eq('user_id', req.user.id),
+      supabase.from('sms_messages').select('*').eq('user_id', req.user.id).order('created_at', { ascending: false })
+    ]);
+
+    for (const [label, result] of [
+      ['payments', paymentsRes], ['documents', documentsRes], ['expenses', expensesRes],
+      ['maintenance_requests', maintenanceRes], ['vendors', vendorsRes], ['sms_messages', smsRes]
+    ]) {
+      if (result.error) {
+        console.error(`Account export: failed to load ${label}`, result.error);
+        return res.status(500).json({ error: 'Failed to generate export' });
+      }
     }
 
     const payload = {
       export_generated_at: new Date().toISOString(),
       account,
-      sms_history: smsHistory || []
+      properties: properties || [],
+      tenants: tenants || [],
+      payments: paymentsRes.data || [],
+      documents: documentsRes.data || [],
+      expenses: expensesRes.data || [],
+      maintenance_requests: maintenanceRes.data || [],
+      vendors: vendorsRes.data || [],
+      sms_history: smsRes.data || []
     };
 
     const filename = `praedium-account-export-${new Date().toISOString().slice(0, 10)}.json`;
