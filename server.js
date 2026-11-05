@@ -3691,7 +3691,7 @@ app.get('/api/account', requireAuth, async (req, res) => {
   try {
     const { data: account, error: accountError } = await supabase
       .from('customers')
-      .select('name, email, phone, preferred_language')
+      .select('name, email, phone, preferred_language, deletion_requested_at')
       .eq('user_id', req.user.id)
       .single();
 
