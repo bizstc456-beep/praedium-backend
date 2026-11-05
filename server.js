@@ -309,6 +309,59 @@ async function requireAdmin(req, res, next) {
   next();
 }
 
+// Express middleware: blocks a landlord whose billing isn't in good
+// standing from using the core product, while always leaving billing and
+// account routes reachable (otherwise there'd be no way to fix it) and
+// never touching the tenant portal, which is a different actor entirely --
+// a landlord's unpaid invoice is never a reason to lock their tenants out
+// of their own portal. "Good standing" means actively trialing/active via
+// Stripe, or never having been through Checkout at all yet but still
+// inside the 30-day registration trial window (trial_ends_at, set at
+// signup -- see /api/auth/register). Admins always pass. Fails OPEN on an
+// unexpected error: a billing-check bug should never be the reason the
+// whole app goes down for every landlord.
+async function requireActiveBilling(req, res, next) {
+  try {
+    const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
+    if (isAdmin) return next();
+
+    const { data: customer } = await supabase
+      .from('customers')
+      .select('subscription_status, trial_ends_at')
+      .eq('user_id', req.user.id)
+      .single();
+
+    // No customer row at all -- not this middleware's problem to diagnose;
+    // let the route itself handle a missing account.
+    if (!customer) return next();
+
+    const status = customer.subscription_status;
+
+    if (status === 'trialing' || status === 'active') {
+      return next();
+    }
+
+    if (!status) {
+      // Never been through Stripe Checkout -- still fine as long as the
+      // registration-time trial window hasn't run out yet.
+      const trialEnds = customer.trial_ends_at ? new Date(customer.trial_ends_at) : null;
+      if (trialEnds && trialEnds > new Date()) {
+        return next();
+      }
+    }
+
+    // past_due, canceled, or an expired never-subscribed trial.
+    return res.status(402).json({
+      error: 'Your Praedium subscription needs attention before you can continue.',
+      code: 'billing_required',
+      subscription_status: status || 'trial_expired',
+    });
+  } catch (error) {
+    console.error('requireActiveBilling check failed, allowing request through:', error);
+    return next();
+  }
+}
+
 // Express middleware: requires a valid session that is linked to a tenant
 // record (tenants.auth_user_id), for the tenant self-service portal.
 // Attaches the tenant row as req.tenant.
@@ -427,7 +480,7 @@ app.post('/api/auth/login', async (req, res) => {
 // ============================================
 
 // Create property
-app.post('/api/properties', requireAuth, async (req, res) => {
+app.post('/api/properties', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { address, city, province, postal_code, property_type, bedrooms, bathrooms, notes } = req.body;
 
@@ -478,7 +531,7 @@ app.post('/api/properties', requireAuth, async (req, res) => {
 });
 
 // Get all properties for a landlord
-app.get('/api/properties/:user_id', requireAuth, async (req, res) => {
+app.get('/api/properties/:user_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { user_id } = req.params;
     const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
@@ -504,7 +557,7 @@ app.get('/api/properties/:user_id', requireAuth, async (req, res) => {
 
 // Update a property you own. user_id is never accepted from the client --
 // ownership can't be transferred through this route.
-app.put('/api/properties/:property_id', requireAuth, async (req, res) => {
+app.put('/api/properties/:property_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { property_id } = req.params;
 
@@ -570,7 +623,7 @@ app.put('/api/properties/:property_id', requireAuth, async (req, res) => {
 // Delete a property (and everything under it) you manage. Removes its
 // tenants' payments and documents, the tenants themselves, the property's
 // own documents, then the property. There's no undo -- the frontend confirms first.
-app.delete('/api/properties/:property_id', requireAuth, async (req, res) => {
+app.delete('/api/properties/:property_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { property_id } = req.params;
 
@@ -635,7 +688,7 @@ function toNullableDate(value) {
 }
 
 // Add a tenant (a unit + its lease) to a property you own
-app.post('/api/tenants', requireAuth, async (req, res) => {
+app.post('/api/tenants', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const {
       property_id, name, email, phone, unit_label, rent_amount, lease_start_date, lease_end_date,
@@ -717,7 +770,7 @@ app.post('/api/tenants', requireAuth, async (req, res) => {
 });
 
 // Update a tenant/lease you manage
-app.put('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
+app.put('/api/tenants/:tenant_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { tenant_id } = req.params;
 
@@ -781,7 +834,7 @@ app.put('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
 
 // Delete a tenant (lease ended / unit vacated) you manage. Cascades to that
 // tenant's payments and documents so nothing orphaned is left behind.
-app.delete('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
+app.delete('/api/tenants/:tenant_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { tenant_id } = req.params;
 
@@ -831,7 +884,7 @@ app.delete('/api/tenants/:tenant_id', requireAuth, async (req, res) => {
 });
 
 // Get tenants for a single property you own
-app.get('/api/tenants/:property_id', requireAuth, async (req, res) => {
+app.get('/api/tenants/:property_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { property_id } = req.params;
 
@@ -869,7 +922,7 @@ app.get('/api/tenants/:property_id', requireAuth, async (req, res) => {
 // ============================================
 
 // Mark a payment as paid for a tenant you manage
-app.post('/api/payments/mark-paid', requireAuth, async (req, res) => {
+app.post('/api/payments/mark-paid', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { tenant_id, amount, payment_date, payment_method } = req.body;
 
@@ -946,7 +999,7 @@ app.post('/api/payments/mark-paid', requireAuth, async (req, res) => {
   }
 });
 // Cancel the most recently recorded payment for a tenant you manage
-app.delete('/api/payments/:tenant_id/latest', requireAuth, async (req, res) => {
+app.delete('/api/payments/:tenant_id/latest', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { tenant_id } = req.params;
 
@@ -999,7 +1052,7 @@ app.delete('/api/payments/:tenant_id/latest', requireAuth, async (req, res) => {
 });
 
 // Get payment history for a tenant you manage
-app.get('/api/payments/:tenant_id', requireAuth, async (req, res) => {
+app.get('/api/payments/:tenant_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { tenant_id } = req.params;
 
@@ -1043,7 +1096,7 @@ app.get('/api/payments/:tenant_id', requireAuth, async (req, res) => {
 });
 
 // Get all payments for a property you own
-app.get('/api/payments/property/:property_id', requireAuth, async (req, res) => {
+app.get('/api/payments/property/:property_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { property_id } = req.params;
 
@@ -1102,7 +1155,7 @@ app.get('/api/payments/property/:property_id', requireAuth, async (req, res) => 
 const EXPENSE_CATEGORIES = ['repairs', 'insurance', 'taxes', 'mortgage', 'utilities', 'management', 'other'];
 
 // Add an expense for a property you own
-app.post('/api/expenses', requireAuth, async (req, res) => {
+app.post('/api/expenses', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { property_id, category, amount, expense_date, notes } = req.body;
 
@@ -1150,7 +1203,7 @@ app.post('/api/expenses', requireAuth, async (req, res) => {
 });
 
 // Update an expense you own
-app.put('/api/expenses/:expense_id', requireAuth, async (req, res) => {
+app.put('/api/expenses/:expense_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { expense_id } = req.params;
 
@@ -1193,7 +1246,7 @@ app.put('/api/expenses/:expense_id', requireAuth, async (req, res) => {
 });
 
 // Delete an expense you own
-app.delete('/api/expenses/:expense_id', requireAuth, async (req, res) => {
+app.delete('/api/expenses/:expense_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { expense_id } = req.params;
 
@@ -1223,7 +1276,7 @@ app.delete('/api/expenses/:expense_id', requireAuth, async (req, res) => {
 });
 
 // All expenses for a landlord, across every property (used by the Reports page)
-app.get('/api/expenses/landlord/:user_id', requireAuth, async (req, res) => {
+app.get('/api/expenses/landlord/:user_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { user_id } = req.params;
     const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
@@ -1248,7 +1301,7 @@ app.get('/api/expenses/landlord/:user_id', requireAuth, async (req, res) => {
 });
 
 // Expenses for a single property you own
-app.get('/api/expenses/property/:property_id', requireAuth, async (req, res) => {
+app.get('/api/expenses/property/:property_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { property_id } = req.params;
 
@@ -1290,7 +1343,7 @@ app.get('/api/expenses/property/:property_id', requireAuth, async (req, res) => 
 // project "expected" rent over an arbitrary range (that gets fuzzy fast once
 // tenants move in/out mid-range); the Dashboard's current-month numbers
 // already cover "expected vs collected" for the present month.
-app.get('/api/reports/:user_id', requireAuth, async (req, res) => {
+app.get('/api/reports/:user_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { user_id } = req.params;
     const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
@@ -1396,7 +1449,7 @@ app.get('/api/reports/:user_id', requireAuth, async (req, res) => {
 // everything else (single-family, condo, unset) is one.
 // UNITS_BY_PROPERTY_TYPE / inferUnitCount now come from lib/planLogic.js (required near the top of this file).
 
-app.get('/api/insights/:user_id', requireAuth, async (req, res) => {
+app.get('/api/insights/:user_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { user_id } = req.params;
     const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
@@ -1600,7 +1653,7 @@ async function resolveDocumentOwner(tenant_id, property_id) {
 
 // Upload a document for a tenant or a property you manage.
 // multipart/form-data fields: file, and either tenant_id or property_id, plus optional category.
-app.post('/api/documents/upload', requireAuth, upload.single('file'), async (req, res) => {
+app.post('/api/documents/upload', requireAuth, requireActiveBilling, upload.single('file'), async (req, res) => {
   try {
     const { tenant_id, property_id, category } = req.body;
     if (!req.file) {
@@ -1659,7 +1712,7 @@ app.post('/api/documents/upload', requireAuth, upload.single('file'), async (req
 });
 
 // List documents for a tenant you manage
-app.get('/api/documents/tenant/:tenant_id', requireAuth, async (req, res) => {
+app.get('/api/documents/tenant/:tenant_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { tenant_id } = req.params;
     const ownerId = await resolveDocumentOwner(tenant_id, null);
@@ -1690,7 +1743,7 @@ app.get('/api/documents/tenant/:tenant_id', requireAuth, async (req, res) => {
 
 // List documents attached directly to a property you manage (building-level
 // docs only -- a tenant's own documents come from the route above).
-app.get('/api/documents/property/:property_id', requireAuth, async (req, res) => {
+app.get('/api/documents/property/:property_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { property_id } = req.params;
     const ownerId = await resolveDocumentOwner(null, property_id);
@@ -1720,7 +1773,7 @@ app.get('/api/documents/property/:property_id', requireAuth, async (req, res) =>
 });
 
 // Delete a document you own
-app.delete('/api/documents/:document_id', requireAuth, async (req, res) => {
+app.delete('/api/documents/:document_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { document_id } = req.params;
 
@@ -1791,7 +1844,7 @@ async function inviteTenantToPortal(tenant) {
   return inviteData.user.id;
 }
 
-app.post('/api/tenants/:tenant_id/invite', requireAuth, async (req, res) => {
+app.post('/api/tenants/:tenant_id/invite', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { tenant_id } = req.params;
 
@@ -1994,7 +2047,7 @@ app.post('/api/tenant-portal/maintenance', requireTenantAuth, uploadImage.single
 });
 
 // Landlord view: all maintenance requests across your properties
-app.get('/api/maintenance/landlord/:user_id', requireAuth, async (req, res) => {
+app.get('/api/maintenance/landlord/:user_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { user_id } = req.params;
     const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
@@ -2038,7 +2091,7 @@ app.get('/api/maintenance/landlord/:user_id', requireAuth, async (req, res) => {
 });
 
 // Landlord: update a maintenance request's status
-app.put('/api/maintenance/:request_id', requireAuth, async (req, res) => {
+app.put('/api/maintenance/:request_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { request_id } = req.params;
     const { status } = req.body;
@@ -2096,7 +2149,7 @@ app.put('/api/maintenance/:request_id', requireAuth, async (req, res) => {
 const VENDOR_TRADES = ['general', 'plumbing', 'electrical', 'hvac', 'cleaning', 'landscaping', 'pest_control', 'locksmith', 'other'];
 
 // List a landlord's vendors
-app.get('/api/vendors/:user_id', requireAuth, async (req, res) => {
+app.get('/api/vendors/:user_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { user_id } = req.params;
     const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
@@ -2121,7 +2174,7 @@ app.get('/api/vendors/:user_id', requireAuth, async (req, res) => {
 });
 
 // Add a vendor
-app.post('/api/vendors', requireAuth, async (req, res) => {
+app.post('/api/vendors', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { trade, name, phone, email } = req.body;
 
@@ -2154,7 +2207,7 @@ app.post('/api/vendors', requireAuth, async (req, res) => {
 });
 
 // Update a vendor you own
-app.put('/api/vendors/:vendor_id', requireAuth, async (req, res) => {
+app.put('/api/vendors/:vendor_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { vendor_id } = req.params;
 
@@ -2201,7 +2254,7 @@ app.put('/api/vendors/:vendor_id', requireAuth, async (req, res) => {
 });
 
 // Delete a vendor you own
-app.delete('/api/vendors/:vendor_id', requireAuth, async (req, res) => {
+app.delete('/api/vendors/:vendor_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { vendor_id } = req.params;
 
@@ -2327,7 +2380,7 @@ function computeRenewalWindow(tenant) {
 
 // Landlord view: every tenant with a lease end date, annotated with their
 // TAL notice window and where they stand in it.
-app.get('/api/lease-renewals/landlord/:user_id', requireAuth, async (req, res) => {
+app.get('/api/lease-renewals/landlord/:user_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { user_id } = req.params;
     const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
@@ -2395,7 +2448,7 @@ app.get('/api/lease-renewals/landlord/:user_id', requireAuth, async (req, res) =
 });
 
 // Landlord: mark that you've sent the renewal/rent-change notice for a tenant
-app.post('/api/tenants/:tenant_id/renewal-notice-sent', requireAuth, async (req, res) => {
+app.post('/api/tenants/:tenant_id/renewal-notice-sent', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { tenant_id } = req.params;
 
@@ -2439,7 +2492,7 @@ app.post('/api/tenants/:tenant_id/renewal-notice-sent', requireAuth, async (req,
 });
 
 // Landlord: undo an accidental "notice sent" mark
-app.delete('/api/tenants/:tenant_id/renewal-notice-sent', requireAuth, async (req, res) => {
+app.delete('/api/tenants/:tenant_id/renewal-notice-sent', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { tenant_id } = req.params;
 
@@ -2487,7 +2540,7 @@ app.delete('/api/tenants/:tenant_id/renewal-notice-sent', requireAuth, async (re
 // ============================================
 
 // Get all tenants across every property owned by a landlord (for the message-composer)
-app.get('/api/tenants/landlord/:user_id', requireAuth, async (req, res) => {
+app.get('/api/tenants/landlord/:user_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { user_id } = req.params;
     const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
@@ -2567,7 +2620,7 @@ app.get('/api/tenants/landlord/:user_id', requireAuth, async (req, res) => {
 });
 
 // Send an SMS to one of your own tenants
-app.post('/api/sms/send', requireAuth, async (req, res) => {
+app.post('/api/sms/send', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { tenant_id, message } = req.body;
     if (!tenant_id || !message) {
@@ -2611,7 +2664,7 @@ app.post('/api/sms/send', requireAuth, async (req, res) => {
 });
 
 // Get SMS history (sent + received) for a landlord
-app.get('/api/sms/inbox/:user_id', requireAuth, async (req, res) => {
+app.get('/api/sms/inbox/:user_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { user_id } = req.params;
     const isAdmin = ADMIN_EMAILS.includes((req.user.email || '').toLowerCase());
@@ -2638,7 +2691,7 @@ app.get('/api/sms/inbox/:user_id', requireAuth, async (req, res) => {
 // SMS quick-action templates (Rent Due Reminder, Late Payment Notice,
 // Payment Received, etc.) -- shared across all landlords, not per-user, so
 // no ownership check is needed here.
-app.get('/api/sms/templates', requireAuth, async (req, res) => {
+app.get('/api/sms/templates', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('sms_templates')
@@ -3455,7 +3508,7 @@ if (RENT_REMINDERS_ENABLED) {
 // DASHBOARD ROUTES
 // ============================================
 
-app.get('/api/dashboard/:user_id', requireAuth, async (req, res) => {
+app.get('/api/dashboard/:user_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { user_id } = req.params;
 

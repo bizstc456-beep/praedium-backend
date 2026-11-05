@@ -100,7 +100,7 @@ function mockVictimOwnedResources() {
     vendors: { id: 'vendor_1', user_id: OWNER_ID },
     documents: { id: 'document_1', user_id: OWNER_ID, storage_path: 'owner/doc.pdf', tenant_id: 'tenant_1' },
     maintenance_requests: { id: 'request_1', property_id: 'property_1' },
-    customers: { id: 'customer_1', user_id: OWNER_ID, stripe_customer_id: 'cus_victim' },
+    customers: { id: 'customer_1', user_id: OWNER_ID, stripe_customer_id: 'cus_victim', subscription_status: 'active', trial_ends_at: null },
   };
   supabaseMock.from.mockImplementation((table) =>
     makeQueryResult({ data: fixtures[table] || null, error: null })
@@ -406,13 +406,103 @@ describe('admin routes reject a logged-in user who is not on the admin allowlist
 // route that rejected *everyone* (including its rightful owner) would
 // still pass every test above.
 // ----------------------------------------------------------------------
+// ----------------------------------------------------------------------
+// Group 5: requireActiveBilling -- a landlord whose subscription isn't in
+// good standing gets blocked from the core product (while billing/account
+// routes and the admin allowlist stay reachable), and one who IS in good
+// standing (or never even started billing but is still inside the
+// registration trial window) is not.
+// ----------------------------------------------------------------------
+describe('requireActiveBilling blocks a landlord whose subscription needs attention', () => {
+  function mockOwnerWithCustomer(customerFields) {
+    supabaseMock.auth.getUser.mockResolvedValue({
+      data: { user: { id: OWNER_ID, email: 'owner@example.com' } },
+      error: null,
+    });
+    supabaseMock.from.mockImplementation((table) => {
+      if (table === 'customers') {
+        return makeQueryResult({ data: { user_id: OWNER_ID, ...customerFields }, error: null });
+      }
+      return makeQueryResult({ data: [], error: null });
+    });
+  }
+
+  test('past_due subscription_status is blocked with a 402 billing_required error', async () => {
+    mockOwnerWithCustomer({ subscription_status: 'past_due', trial_ends_at: null });
+    const res = await request(app).get(`/api/properties/${OWNER_ID}`).set('Authorization', 'Bearer faketoken');
+    expect(res.status).toBe(402);
+    expect(res.body.code).toBe('billing_required');
+  });
+
+  test('canceled subscription_status is blocked with a 402 billing_required error', async () => {
+    mockOwnerWithCustomer({ subscription_status: 'canceled', trial_ends_at: null });
+    const res = await request(app).get(`/api/properties/${OWNER_ID}`).set('Authorization', 'Bearer faketoken');
+    expect(res.status).toBe(402);
+    expect(res.body.code).toBe('billing_required');
+  });
+
+  test('never subscribed and the registration trial has expired is blocked', async () => {
+    mockOwnerWithCustomer({ subscription_status: null, trial_ends_at: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString() });
+    const res = await request(app).get(`/api/properties/${OWNER_ID}`).set('Authorization', 'Bearer faketoken');
+    expect(res.status).toBe(402);
+    expect(res.body.code).toBe('billing_required');
+  });
+
+  test('never subscribed but still inside the registration trial window is allowed through', async () => {
+    mockOwnerWithCustomer({ subscription_status: null, trial_ends_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() });
+    const res = await request(app).get(`/api/properties/${OWNER_ID}`).set('Authorization', 'Bearer faketoken');
+    expect(res.status).not.toBe(402);
+  });
+
+  test('trialing subscription_status is allowed through', async () => {
+    mockOwnerWithCustomer({ subscription_status: 'trialing', trial_ends_at: null });
+    const res = await request(app).get(`/api/properties/${OWNER_ID}`).set('Authorization', 'Bearer faketoken');
+    expect(res.status).not.toBe(402);
+  });
+
+  test('billing routes stay reachable even with a past_due subscription (otherwise there\'s no way to fix it)', async () => {
+    mockOwnerWithCustomer({ subscription_status: 'past_due', trial_ends_at: null });
+    const res = await request(app).get(`/api/billing/plan/${OWNER_ID}`).set('Authorization', 'Bearer faketoken');
+    expect(res.status).not.toBe(402);
+  });
+
+  test('account routes stay reachable even with a canceled subscription', async () => {
+    mockOwnerWithCustomer({ subscription_status: 'canceled', trial_ends_at: null });
+    const res = await request(app).get('/api/account').set('Authorization', 'Bearer faketoken');
+    expect(res.status).not.toBe(402);
+  });
+
+  test('an admin is never blocked, regardless of their own billing status', async () => {
+    supabaseMock.auth.getUser.mockResolvedValue({
+      data: { user: { id: 'admin_user', email: 'admin@example.com' } },
+      error: null,
+    });
+    supabaseMock.from.mockImplementation((table) => {
+      if (table === 'customers') {
+        return makeQueryResult({ data: { user_id: 'admin_user', subscription_status: 'canceled', trial_ends_at: null }, error: null });
+      }
+      return makeQueryResult({ data: [], error: null });
+    });
+    const res = await request(app).get('/api/properties/admin_user').set('Authorization', 'Bearer faketoken');
+    expect(res.status).not.toBe(402);
+  });
+});
+
 describe('the actual owner is not blocked by their own ownership check', () => {
   test('GET /api/properties/:user_id succeeds for the resource\'s own landlord', async () => {
     supabaseMock.auth.getUser.mockResolvedValue({
       data: { user: { id: OWNER_ID, email: 'owner@example.com' } },
       error: null,
     });
-    supabaseMock.from.mockImplementation(() => makeQueryResult({ data: [], error: null }));
+    // requireActiveBilling looks up a customers row before the route itself
+    // runs -- needs an active subscription here, same as every other
+    // "this should actually succeed" case in this describe block, or
+    // everything but customers falls back to the generic empty-list mock.
+    supabaseMock.from.mockImplementation((table) =>
+      table === 'customers'
+        ? makeQueryResult({ data: { subscription_status: 'active', trial_ends_at: null }, error: null })
+        : makeQueryResult({ data: [], error: null })
+    );
 
     const res = await request(app).get(`/api/properties/${OWNER_ID}`).set('Authorization', 'Bearer faketoken');
     expect(res.status).toBe(200);
