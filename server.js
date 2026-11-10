@@ -2068,7 +2068,7 @@ app.get('/api/maintenance/landlord/:user_id', requireAuth, requireActiveBilling,
 
     const { data: requests, error } = await supabase
       .from('maintenance_requests')
-      .select('*, tenants(name, unit_label), properties(address)')
+      .select('*, tenants(name, unit_label), properties(address), vendors(id, name, trade, phone)')
       .in('property_id', propertyIds)
       .order('created_at', { ascending: false });
 
@@ -2090,11 +2090,15 @@ app.get('/api/maintenance/landlord/:user_id', requireAuth, requireActiveBilling,
   }
 });
 
-// Landlord: update a maintenance request's status
+// Landlord: update a maintenance request's status and/or assigned vendor.
+// vendor_id is optional -- omit it to leave the assignment untouched, or
+// pass null to unassign. When provided, it must be one of this same
+// landlord's own vendors, never another landlord's contact.
 app.put('/api/maintenance/:request_id', requireAuth, requireActiveBilling, async (req, res) => {
   try {
     const { request_id } = req.params;
-    const { status } = req.body;
+    const { status, vendor_id } = req.body;
+    const vendorIdProvided = Object.prototype.hasOwnProperty.call(req.body, 'vendor_id');
 
     if (!MAINTENANCE_STATUSES.includes(status)) {
       return res.status(400).json({ error: `status must be one of: ${MAINTENANCE_STATUSES.join(', ')}` });
@@ -2123,9 +2127,23 @@ app.put('/api/maintenance/:request_id', requireAuth, requireActiveBilling, async
       return res.status(403).json({ error: 'You do not manage this property' });
     }
 
+    if (vendorIdProvided && vendor_id) {
+      const { data: vendor, error: vendorError } = await supabase
+        .from('vendors')
+        .select('id, user_id')
+        .eq('id', vendor_id)
+        .single();
+      if (vendorError || !vendor || (vendor.user_id !== property.user_id && !isAdmin)) {
+        return res.status(400).json({ error: 'Vendor not found' });
+      }
+    }
+
+    const updates = { status, updated_at: new Date() };
+    if (vendorIdProvided) updates.vendor_id = vendor_id || null;
+
     const { data, error } = await supabase
       .from('maintenance_requests')
-      .update({ status, updated_at: new Date() })
+      .update(updates)
       .eq('id', request_id)
       .select();
 
@@ -2609,6 +2627,7 @@ app.get('/api/tenants/landlord/:user_id', requireAuth, requireActiveBilling, asy
         pending_amount: pending,
         status: pending > 0 ? 'pending' : 'paid',
         renewal_soon: !!renewalWindow && (renewalWindow.status === 'in_window' || renewalWindow.status === 'window_passed'),
+        renewal_window_status: renewalWindow ? renewalWindow.status : null,
         days_until_lease_end: daysUntilLeaseEnd,
       };
     });
@@ -3558,9 +3577,10 @@ async function sendDueRentReminders() {
     for (const { tenant, isUpcoming } of candidates) {
       if (paidTenantIds.has(tenant.id)) continue;
 
+      const rentDollars = ((tenant.rent_amount || 0) / 100).toFixed(2);
       const message = withSmsFooter(isUpcoming
-        ? `Hi ${tenant.name}, friendly reminder that your rent of $${tenant.rent_amount} is due in 3 days.`
-        : `Hi ${tenant.name}, your rent of $${tenant.rent_amount} was due a couple days ago. Please arrange payment as soon as you can.`);
+        ? `Hi ${tenant.name}, friendly reminder that your rent of $${rentDollars} is due in 3 days.`
+        : `Hi ${tenant.name}, your rent of $${rentDollars} was due a couple days ago. Please arrange payment as soon as you can.`);
 
       try {
         const ownerId = ownerByPropertyId[tenant.property_id] || null;
@@ -3657,6 +3677,7 @@ app.get('/api/dashboard/:user_id', requireAuth, requireActiveBilling, async (req
         pending_amount: pending,
         status: pending > 0 ? 'pending' : 'paid',
         renewal_soon: !!renewalWindow && (renewalWindow.status === 'in_window' || renewalWindow.status === 'window_passed'),
+        renewal_window_status: renewalWindow ? renewalWindow.status : null,
         days_until_lease_end: daysUntilLeaseEnd,
       };
     });
