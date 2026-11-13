@@ -408,6 +408,14 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: authError.message });
     }
 
+    // No code-tracked free grace period here anymore -- card collection
+    // now happens immediately via Stripe Checkout (see RegisterPage.js,
+    // which sends the new landlord straight to /payment). Leaving
+    // trial_ends_at unset means requireActiveBilling's fallback finds no
+    // trial window and returns 402 billing_required on their very first
+    // dashboard request, which is exactly what routes them to checkout.
+    // Existing accounts that already have a trial_ends_at from before this
+    // change keep their already-granted free window untouched.
     const { data: customer, error: dbError } = await supabase
       .from('customers')
       .insert([
@@ -416,7 +424,6 @@ app.post('/api/auth/register', async (req, res) => {
           email,
           name,
           phone,
-          trial_ends_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
           status: 'active',
           plan_tier: DEFAULT_PLAN_TIER
         }
