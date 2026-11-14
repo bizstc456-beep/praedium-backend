@@ -399,17 +399,19 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    // emailRedirectTo sends them straight to plan selection once they
-    // click the confirmation link, instead of Supabase's default landing
-    // spot (the Site URL, which is the dashboard root) -- without this,
-    // confirming email dropped new landlords into the dashboard with no
-    // customer-created session along the way to redirect them to /payment,
-    // relying entirely on the first gated API call to bounce them there.
+    // emailRedirectTo sends them straight to the mandatory plan-selection
+    // page once they click the confirmation link, instead of Supabase's
+    // default landing spot (the Site URL, which is the dashboard root).
+    // /subscribe has no sidebar and no way to reach app data -- it's the
+    // actual gate that keeps an unpaid signup out of the product, not
+    // just a convenience redirect (App.js also blocks every core route
+    // for a logged-in user with no subscription, as a second line of
+    // defense if this ever lands somewhere else).
     const frontendUrl = (process.env.FRONTEND_URL || 'https://app.praedium.pro').split(',')[0].trim().replace(/\/$/, '');
     const { data: authData, error: authError } = await supabase.auth.signUp({
       email,
       password,
-      options: { emailRedirectTo: `${frontendUrl}/payment` }
+      options: { emailRedirectTo: `${frontendUrl}/subscribe` }
     });
 
     if (authError) {
