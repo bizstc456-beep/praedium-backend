@@ -399,9 +399,17 @@ app.post('/api/auth/register', async (req, res) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
+    // emailRedirectTo sends them straight to plan selection once they
+    // click the confirmation link, instead of Supabase's default landing
+    // spot (the Site URL, which is the dashboard root) -- without this,
+    // confirming email dropped new landlords into the dashboard with no
+    // customer-created session along the way to redirect them to /payment,
+    // relying entirely on the first gated API call to bounce them there.
+    const frontendUrl = (process.env.FRONTEND_URL || 'https://app.praedium.pro').split(',')[0].trim().replace(/\/$/, '');
     const { data: authData, error: authError } = await supabase.auth.signUp({
       email,
-      password
+      password,
+      options: { emailRedirectTo: `${frontendUrl}/payment` }
     });
 
     if (authError) {
