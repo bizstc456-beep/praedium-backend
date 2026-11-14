@@ -431,7 +431,22 @@ app.post('/api/auth/register', async (req, res) => {
       .select();
 
     if (dbError) {
-      return res.status(400).json({ error: dbError.message });
+      console.error('Register: customers insert failed:', dbError);
+      // Never surface a raw Postgres error to the person signing up --
+      // "duplicate key value violates unique constraint ..." reads as a
+      // broken product. The one case worth telling them about specifically
+      // is their email already having an account (most often because
+      // Supabase silently reuses an existing unconfirmed auth user and
+      // resends its confirmation email, so signUp() above succeeded even
+      // though this insert can't, since a customers row for that email
+      // already exists); anything else gets a generic, still-friendly
+      // fallback.
+      if (dbError.code === '23505') {
+        return res.status(409).json({
+          error: 'An account with this email already exists. Try signing in, or use "Forgot password" if you need to reset it.'
+        });
+      }
+      return res.status(500).json({ error: 'Something went wrong creating your account. Please try again.' });
     }
 
     // Onboarding automation: welcome the new landlord by text as soon as
